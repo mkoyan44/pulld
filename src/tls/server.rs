@@ -3,11 +3,17 @@ use crate::error::{DockerProxyError, Result};
 use axum_server::tls_rustls::RustlsConfig;
 use rustls::crypto::{ring::default_provider, CryptoProvider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustls_pemfile::{certs, private_key};
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use std::sync::Arc;
+
+fn parse_private_key(mut reader: impl BufRead) -> Result<PrivateKeyDer<'static>> {
+    private_key(&mut reader)
+        .map_err(|e| DockerProxyError::Tls(format!("Failed to parse private key: {}", e)))?
+        .ok_or_else(|| DockerProxyError::Tls("No private keys found".to_string()))
+}
 
 /// Create TLS config from PEM strings (from vault)
 pub async fn create_server_tls_config_from_pem(
@@ -28,16 +34,7 @@ pub async fn create_server_tls_config_from_pem(
     }
 
     // Parse private key from PEM string
-    let mut key_reader = Cursor::new(server_key_pem.as_bytes());
-    let mut keys: Vec<_> = pkcs8_private_keys(&mut key_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| DockerProxyError::Tls(format!("Failed to parse private key: {}", e)))?;
-
-    if keys.is_empty() {
-        return Err(DockerProxyError::Tls("No private keys found".to_string()));
-    }
-
-    let key = PrivateKeyDer::Pkcs8(keys.remove(0));
+    let key = parse_private_key(Cursor::new(server_key_pem.as_bytes()))?;
 
     // Build TLS config (no client auth)
     let rustls_config = rustls::ServerConfig::builder()
@@ -87,16 +84,7 @@ pub async fn create_server_tls_config(tls_config: &TlsConfig) -> Result<RustlsCo
         // Load private key from file
         let key_file = File::open(key_path)
             .map_err(|e| DockerProxyError::Tls(format!("Failed to open key file: {}", e)))?;
-        let mut key_reader = BufReader::new(key_file);
-        let mut keys: Vec<_> = pkcs8_private_keys(&mut key_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| DockerProxyError::Tls(format!("Failed to parse private key: {}", e)))?;
-
-        if keys.is_empty() {
-            return Err(DockerProxyError::Tls("No private keys found".to_string()));
-        }
-
-        let key = PrivateKeyDer::Pkcs8(keys.remove(0));
+        let key = parse_private_key(BufReader::new(key_file))?;
 
         // Build TLS config
         let rustls_config = if tls_config.client_auth {
@@ -151,5 +139,27 @@ pub async fn create_server_tls_config(tls_config: &TlsConfig) -> Result<RustlsCo
         Err(DockerProxyError::Tls(
             "TLS enabled but no certificate paths provided. Use create_server_tls_config_from_pem() with vault certificates.".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RSA_PKCS1_PRIVATE_KEY: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+MIIBOwIBAAJBAKeVcMWfTRrsqVBOHbEaRoeLxsMLXc19yDEyTc9FuOmIA8hTVs4e
+vjWqgVhQ63REq5Tne9YnJIo/zK4uscIwmxkCAwEAAQJAAhQzgvAX98aJzyo46hKG
+X3YXcCH69uqhiiKynmiiA5ucNNBjKQ0GZv7vCc/kpvGYbPzQdoJ9xxwSeQ9bESdC
+kQIhAM/1D9+tBNpidn8Fjoy4YUZ6G86J85f2J+SqsdVbVfbNAiEAzkyfGrsFR6Lr
+kz/jSV+Mr4xkkXxklJOCyHvTuoyJfX0CIEfiUDBjYHAU5R0XUKU3/vgbsYz9hqSa
+xEN49avovJhpAiEAx6kYg4JlxcNERCsdCrJTMsOpwbSmk7WAahCOBopltvECIQCr
+j+txOvnb0LWjS5bIyhRvVW6AED3TQMv/8p7/nJv7zg==
+-----END RSA PRIVATE KEY-----"#;
+
+    #[test]
+    fn parse_private_key_accepts_pkcs1_rsa_keys() {
+        let key = parse_private_key(Cursor::new(RSA_PKCS1_PRIVATE_KEY.as_bytes())).unwrap();
+
+        assert!(matches!(key, PrivateKeyDer::Pkcs1(_)));
     }
 }
