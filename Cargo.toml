@@ -1,0 +1,57 @@
+[package]
+name = "pulld"
+version = "0.1.0"
+edition = "2021"
+description = "A local registry pull-through proxy with caching, mirrors, pre-pull, Helm cache, and TLS support."
+license = "MIT"
+repository = "https://github.com/mkoyan44/pulld"
+homepage = "https://github.com/mkoyan44/pulld"
+documentation = "https://docs.rs/pulld"
+readme = "README.md"
+keywords = ["registry", "docker", "container", "cache", "proxy"]
+categories = ["command-line-utilities", "network-programming", "caching"]
+exclude = [
+    "docs/plans/*",
+]
+
+[[bin]]
+name = "pulld"
+path = "src/bin/pulld.rs"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
+toml = "0.8"
+
+[dependencies]
+# HTTP server with TLS
+axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client with custom TLS
+reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json"] }
+
+# TLS/Crypto
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+rcgen = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Utilities
+sha2 = "0.10"
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
+futures = "0.3"
+bytes = "1.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
