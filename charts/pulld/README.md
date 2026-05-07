@@ -7,7 +7,7 @@ an optional persistent cache volume.
 
 ```bash
 helm install pulld oci://ghcr.io/mkoyan44/charts/pulld \
-  --version 0.1.0 \
+  --version 0.1.1 \
   --namespace pulld \
   --create-namespace
 ```
@@ -29,6 +29,7 @@ helm template pulld charts/pulld --namespace pulld
 | `cache.dir` | `/var/lib/pulld/cache` | Cache directory passed to the `pulld` binary. |
 | `persistence.enabled` | `true` | Use a PVC for the registry and Helm cache. |
 | `persistence.size` | `20Gi` | PVC size. |
+| `test.enabled` | `false` | Render the Helm test pod. Keep disabled for Terraform `helm_template` consumers. |
 
 Pulld exposes `/health`, `/v2/`, `/helm/<repo>/index.yaml`, and the pre-pull
 API on the same HTTP port.

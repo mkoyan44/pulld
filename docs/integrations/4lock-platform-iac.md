@@ -26,13 +26,13 @@ module "pulld" {
   release_name  = "pulld"
   namespace     = "pulld"
   chart         = "pulld"
-  chart_version = "0.1.0"
+  chart_version = "0.1.1"
   repository    = "oci://ghcr.io/mkoyan44/charts"
 
   values_yaml = yamlencode({
     image = {
       repository = "ghcr.io/mkoyan44/pulld"
-      tag        = "0.1.0"
+      tag        = "0.1.1"
     }
 
     persistence = {
@@ -85,13 +85,13 @@ inputs = {
   release_name  = "pulld"
   namespace     = "pulld"
   chart         = "pulld"
-  chart_version = "0.1.0"
+  chart_version = "0.1.1"
   repository    = "oci://ghcr.io/mkoyan44/charts"
 
   values_yaml = yamlencode({
     image = {
       repository = "ghcr.io/mkoyan44/pulld"
-      tag        = "0.1.0"
+      tag        = "0.1.1"
     }
 
     persistence = {

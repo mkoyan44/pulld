@@ -107,6 +107,7 @@ runtimeClassName: ""
 terminationGracePeriodSeconds: 30
 
 test:
+  enabled: false
   image:
     repository: busybox
     tag: "1.36"
