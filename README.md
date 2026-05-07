@@ -28,6 +28,20 @@ For local development:
 cargo run --bin pulld -- ./cache/pulld
 ```
 
+Build the container image:
+
+```bash
+docker build -t ghcr.io/mkoyan44/pulld:0.1.0 .
+```
+
+Install with Helm:
+
+```bash
+helm install pulld charts/pulld \
+  --namespace pulld \
+  --create-namespace
+```
+
 The server listens on `0.0.0.0:5050` by default and exposes:
 
 - `GET /health`
@@ -71,6 +85,14 @@ cargo run --example https_server
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo package --allow-dirty
+helm lint charts/pulld
+helm template pulld charts/pulld --namespace pulld
+```
+
+Run all local verification:
+
+```bash
+make verify
 ```
 
 ## Source Lineage

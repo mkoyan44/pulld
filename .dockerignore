@@ -1,0 +1,5 @@
+/.git
+/.github
+/cache
+/target
+**/.DS_Store

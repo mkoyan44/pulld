@@ -1,0 +1,11 @@
+Pulld has been installed.
+
+Service:
+  {{ include "pulld.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+Health check:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pulld.fullname" . }} 5050:{{ .Values.service.port }}
+  curl http://127.0.0.1:5050/health
+
+Container registry endpoint:
+  http://{{ include "pulld.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}

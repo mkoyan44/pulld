@@ -20,7 +20,7 @@ path = "src/bin/pulld.rs"
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 toml = "0.8"
 
 [dependencies]
@@ -30,7 +30,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client with custom TLS
-reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 
 # TLS/Crypto
 rustls = { version = "0.23", features = ["ring"] }
