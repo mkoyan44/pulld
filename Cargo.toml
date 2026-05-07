@@ -1,6 +1,6 @@
 [package]
 name = "pulld"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A local registry pull-through proxy with caching, mirrors, pre-pull, Helm cache, and TLS support."
 license = "MIT"
@@ -50,6 +50,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = "0.1"
 futures = "0.3"
 bytes = "1.5"
+base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"

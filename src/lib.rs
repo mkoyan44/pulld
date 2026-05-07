@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod cache;
 pub mod certs;
 pub mod config;

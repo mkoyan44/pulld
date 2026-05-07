@@ -48,8 +48,7 @@ async fn get_v2_wrapper(
         );
     }
 
-    // Log HTTP requests (use tracing so logs are visible when spawned in tasks)
-    tracing::debug!("[pulld] HTTP request: GET {}", path);
+    tracing::info!(method = "GET", path = %path, "Registry request received");
 
     tracing::debug!(
         path = %path,
@@ -61,11 +60,11 @@ async fn get_v2_wrapper(
         let name = path[V2_PREFIX.len()..manifests_idx].to_string();
         let reference = path[manifests_idx + MANIFESTS_SUFFIX.len()..].to_string();
 
-        tracing::debug!(
+        tracing::info!(
             original_path = %path,
             parsed_name = %name,
             parsed_reference = %reference,
-            "[pulld] Manifest request parsed from path"
+            "Registry manifest request parsed"
         );
 
         tracing::debug!(
@@ -84,7 +83,12 @@ async fn get_v2_wrapper(
         let name = path[V2_PREFIX.len()..blobs_idx].to_string();
         let digest = path[blobs_idx + BLOBS_SUFFIX.len()..].to_string();
 
-        tracing::debug!("[pulld] Blob request: name={}, digest={}", name, digest);
+        tracing::info!(
+            method = "GET",
+            name = %name,
+            digest = %digest,
+            "Registry blob request parsed"
+        );
 
         tracing::debug!(
             name = %name,
@@ -122,6 +126,13 @@ async fn head_v2_wrapper(
         let name = path[V2_PREFIX.len()..manifests_idx].to_string();
         let reference = path[manifests_idx + MANIFESTS_SUFFIX.len()..].to_string();
 
+        tracing::info!(
+            method = "HEAD",
+            name = %name,
+            reference = %reference,
+            "Registry manifest request parsed"
+        );
+
         // Handle HEAD manifest request - head_manifest can handle both tags and digests
         head_manifest(State(state), Path((name, reference)))
             .await
@@ -129,6 +140,12 @@ async fn head_v2_wrapper(
     } else if let Some(blobs_idx) = path.rfind(BLOBS_SUFFIX) {
         let name = path[V2_PREFIX.len()..blobs_idx].to_string();
         let digest = path[blobs_idx + BLOBS_SUFFIX.len()..].to_string();
+        tracing::info!(
+            method = "HEAD",
+            name = %name,
+            digest = %digest,
+            "Registry blob request parsed"
+        );
         head_blob(State(state), Path((name, digest)))
             .await
             .into_response()
@@ -143,6 +160,7 @@ fn build_router(app_state: crate::registry::manifest::AppState) -> Router {
         .route("/v2/*path", get(get_v2_wrapper).head(head_v2_wrapper))
         .route("/helm/:repo/index.yaml", get(get_index))
         .route("/helm/:repo/charts/:chart", get(get_chart))
+        .route("/mutate/pods", post(mutate_pods))
         .route("/api/v1/pre-pull", post(pre_pull))
         .route("/api/v1/cache/stats", get(cache_stats))
         .route("/api/v1/mirror/stats", get(mirror_stats))
@@ -451,8 +469,18 @@ pub async fn start_server(
 }
 
 async fn api_version() -> impl IntoResponse {
-    tracing::debug!("GET /v2/ - API version request");
+    tracing::info!(
+        method = "GET",
+        path = "/v2/",
+        "Registry API version request"
+    );
     (StatusCode::OK, "{}")
+}
+
+async fn mutate_pods(Json(review): Json<crate::admission::AdmissionReview>) -> impl IntoResponse {
+    let endpoint = std::env::var("PULLD_ADMISSION_REGISTRY_ENDPOINT")
+        .unwrap_or_else(|_| "pulld.4lock.net".to_string());
+    Json(crate::admission::mutate_pod_review(review, &endpoint))
 }
 
 async fn health() -> impl IntoResponse {
