@@ -8,9 +8,7 @@ use axum::{
 };
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio_util::io::ReaderStream;
+use tokio::io::AsyncWriteExt;
 
 /// GET /v2/{name}/blobs/{digest}
 ///
@@ -37,183 +35,110 @@ pub async fn get_blob(
         .and_then(|s| s.strip_suffix('-'))
         .and_then(|s| s.parse().ok());
 
+    let (registry, repository) = crate::registry::manifest::parse_repository(&_name);
+    let image = format!("{}@{}", _name, digest);
     let cache = &state.cache;
     let blob_path = cache.blob_path(&digest);
+    let cache_backend = if cache.is_object_store_backed() {
+        "s3"
+    } else {
+        "filesystem"
+    };
 
-    // Check cache first - use async metadata check for reliable filesystem state
-    // This is more reliable than exists() for detecting recently written files
     tracing::debug!(
         digest = %digest,
         cache_path = %blob_path.display(),
+        cache_backend = %cache_backend,
         "Checking cache for blob"
     );
 
-    // Also check for temp file (in case rename hasn't completed yet)
-    let temp_path = blob_path.with_extension("tmp");
-
-    match tokio::fs::metadata(&blob_path).await {
-        Ok(metadata) => {
-            let size = metadata.len();
-            if size > 0 {
-                tracing::info!(
-                    digest = %digest,
-                    size = size,
-                    cache_path = %blob_path.display(),
-                    "Cache HIT"
-                );
-
-                if let Ok(mut file) = File::open(&blob_path).await {
-                    // Handle Range request for cached blobs
-                    if let Some(start) = client_range_start {
-                        if start < size {
-                            use tokio::io::AsyncSeekExt;
-                            if file.seek(std::io::SeekFrom::Start(start)).await.is_ok() {
-                                let remaining = size - start;
-                                let reader = BufReader::with_capacity(64 * 1024, file);
-                                let stream = ReaderStream::new(reader);
-                                let body = Body::from_stream(stream);
-
-                                let mut headers = HeaderMap::new();
-                                headers.insert(
-                                    "Content-Type",
-                                    "application/octet-stream".parse().unwrap(),
-                                );
-                                headers.insert(
-                                    "Content-Length",
-                                    remaining.to_string().parse().unwrap(),
-                                );
-                                headers.insert(
-                                    "Content-Range",
-                                    format!("bytes {}-{}/{}", start, size - 1, size)
-                                        .parse()
-                                        .unwrap(),
-                                );
-                                headers.insert("X-Cache", "HIT".parse().unwrap());
-                                return (StatusCode::PARTIAL_CONTENT, headers, body)
-                                    .into_response();
-                            }
-                        }
-                    }
-
-                    let reader = BufReader::with_capacity(64 * 1024, file);
-                    let stream = ReaderStream::new(reader);
-                    let body = Body::from_stream(stream);
-
-                    let mut headers = HeaderMap::new();
-                    headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-                    headers.insert("Content-Length", size.to_string().parse().unwrap());
-                    headers.insert("X-Cache", "HIT".parse().unwrap());
-                    return (StatusCode::OK, headers, body).into_response();
-                } else {
-                    tracing::warn!(
-                        digest = %digest,
-                        cache_path = %blob_path.display(),
-                        "Cache file exists but cannot be opened"
-                    );
-                }
+    match cache.open_blob(&digest, client_range_start).await {
+        Ok(Some(cached_blob)) => {
+            let start = cached_blob.range_start.unwrap_or(0);
+            let remaining = cached_blob.size - start;
+            let cache_status = if start > 0 {
+                StatusCode::PARTIAL_CONTENT
             } else {
-                tracing::warn!(
-                    digest = %digest,
-                    cache_path = %blob_path.display(),
-                    "Cache file exists but is empty (size=0)"
+                StatusCode::OK
+            };
+            tracing::info!(
+                event = "pulld_image_blob_cache_hit",
+                image = %image,
+                digest = %digest,
+                size = cached_blob.size,
+                range_start = start,
+                cache_backend = %cache_backend,
+                "Pulld image blob cache hit"
+            );
+            state
+                .record_pull_event(
+                    PullEvent::new(
+                        "pulld_image_blob_cache_hit",
+                        image.clone(),
+                        format!(
+                            "blob cache hit backend={} size={} range_start={}",
+                            cache_backend, cached_blob.size, start
+                        ),
+                    )
+                    .method("GET")
+                    .status(cache_status.to_string())
+                    .cache("HIT")
+                    .digest(digest.clone()),
+                )
+                .await;
+
+            let mut headers = HeaderMap::new();
+            headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+            headers.insert("Content-Length", remaining.to_string().parse().unwrap());
+            headers.insert("X-Cache", "HIT".parse().unwrap());
+            if start > 0 {
+                headers.insert(
+                    "Content-Range",
+                    format!(
+                        "bytes {}-{}/{}",
+                        start,
+                        cached_blob.size - 1,
+                        cached_blob.size
+                    )
+                    .parse()
+                    .unwrap(),
                 );
-                // Cache file exists but is invalid - delete it
-                let _ = tokio::fs::remove_file(&blob_path).await;
+                return (StatusCode::PARTIAL_CONTENT, headers, cached_blob.body).into_response();
             }
+            return (StatusCode::OK, headers, cached_blob.body).into_response();
+        }
+        Ok(None) => {
+            tracing::warn!(
+                event = "pulld_image_blob_cache_miss",
+                image = %image,
+                digest = %digest,
+                cache_path = %blob_path.display(),
+                cache_backend = %cache_backend,
+                "Pulld image blob cache miss"
+            );
+            state
+                .record_pull_event(
+                    PullEvent::new(
+                        "pulld_image_blob_cache_miss",
+                        image.clone(),
+                        format!("blob cache miss backend={}", cache_backend),
+                    )
+                    .method("GET")
+                    .cache("MISS")
+                    .digest(digest.clone()),
+                )
+                .await;
         }
         Err(e) => {
-            // Check if temp file exists (rename in progress)
-            if let Ok(temp_metadata) = tokio::fs::metadata(&temp_path).await {
-                let temp_size = temp_metadata.len();
-                if temp_size > 0 {
-                    tracing::debug!(
-                        digest = %digest,
-                        temp_size = temp_size,
-                        temp_path = %temp_path.display(),
-                        "Cache file not found but temp file exists - waiting for rename to complete"
-                    );
-                    // Wait a bit for rename to complete, then retry
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    // Retry metadata check
-                    if let Ok(metadata) = tokio::fs::metadata(&blob_path).await {
-                        let size = metadata.len();
-                        if size > 0 {
-                            tracing::info!(
-                                digest = %digest,
-                                size = size,
-                                cache_path = %blob_path.display(),
-                                "Cache HIT (after waiting for rename)"
-                            );
-                            if let Ok(file) = File::open(&blob_path).await {
-                                let reader = BufReader::with_capacity(64 * 1024, file);
-                                let stream = ReaderStream::new(reader);
-                                let body = Body::from_stream(stream);
-
-                                let mut headers = HeaderMap::new();
-                                headers.insert(
-                                    "Content-Type",
-                                    "application/octet-stream".parse().unwrap(),
-                                );
-                                headers.insert("Content-Length", size.to_string().parse().unwrap());
-                                headers.insert("X-Cache", "HIT".parse().unwrap());
-                                return (StatusCode::OK, headers, body).into_response();
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Diagnostic: Check if parent directory exists and list files (for debugging)
-            if let Some(parent) = blob_path.parent() {
-                if let Ok(parent_metadata) = tokio::fs::metadata(parent).await {
-                    if parent_metadata.is_dir() {
-                        // Try to read directory to see what files are actually there
-                        if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
-                            let mut found_files = Vec::new();
-                            while let Ok(Some(entry)) = entries.next_entry().await {
-                                if let Ok(name) = entry.file_name().into_string() {
-                                    found_files.push(name);
-                                }
-                            }
-                            let expected_name = blob_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown");
-                            let has_file = found_files.iter().any(|f| f.as_str() == expected_name);
-                            let has_temp = found_files
-                                .iter()
-                                .any(|f| f.as_str() == format!("{}.tmp", expected_name));
-
-                            tracing::debug!(
-                                digest = %digest,
-                                cache_path = %blob_path.display(),
-                                expected_filename = expected_name,
-                                files_in_dir = ?found_files,
-                                file_exists = has_file,
-                                temp_exists = has_temp,
-                                "Directory listing for cache diagnostic"
-                            );
-                        }
-                    }
-                }
-            }
-
-            if e.kind() == std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    digest = %digest,
-                    cache_path = %blob_path.display(),
-                    "Cache MISS - file not found"
-                );
-            } else {
-                // Non-NotFound error (permission, etc.) - log at warn level
-                tracing::warn!(
-                    digest = %digest,
-                    cache_path = %blob_path.display(),
-                    error = %e,
-                    error_kind = ?e.kind(),
-                    "Cache check failed with non-NotFound error - will fetch from upstream"
-                );
-            }
+            tracing::warn!(
+                event = "pulld_image_blob_cache_check_failed",
+                image = %image,
+                digest = %digest,
+                cache_path = %blob_path.display(),
+                cache_backend = %cache_backend,
+                error = %e,
+                "Cache check failed - will fetch from upstream"
+            );
         }
     }
 
@@ -225,7 +150,6 @@ pub async fn get_blob(
         "Cache MISS - fetching from upstream"
     );
 
-    let (registry, repository) = crate::registry::manifest::parse_repository(&_name);
     let upstream_client = state.get_upstream_client(&registry);
     let mirrors = upstream_client.mirrors();
 
@@ -237,8 +161,6 @@ pub async fn get_blob(
     let registry_config = state.get_registry_config(&registry);
     let strategy = registry_config.strategy;
     let hedge_delay_ms = registry_config.hedge_delay_ms;
-    let image = format!("{}@{}", _name, digest);
-
     // Check for existing partial file for resume
     let temp_path = blob_path.with_extension("tmp");
     let mut resume_position: Option<u64> = None;
@@ -816,27 +738,54 @@ pub async fn get_blob(
                 let digest_ok = calculated_digest == digest_clone;
 
                 if size_ok && digest_ok {
-                    if tokio::fs::rename(&temp_path, &blob_path).await.is_ok() {
-                        tracing::info!(
-                            event = "pulld_image_blob_cached",
-                            image = %image_clone,
-                            digest = %digest_clone,
-                            size = total_bytes,
-                            "Pulld image blob cached successfully"
-                        );
-                        event_state
-                            .record_pull_event(
-                                PullEvent::new(
-                                    "pulld_image_blob_cached",
-                                    image_clone.clone(),
-                                    format!("blob cached successfully size={}", total_bytes),
+                    match cache_clone
+                        .commit_blob_from_temp(&digest_clone, &temp_path)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                event = "pulld_image_blob_cached",
+                                image = %image_clone,
+                                digest = %digest_clone,
+                                size = total_bytes,
+                                object_store = cache_clone.is_object_store_backed(),
+                                "Pulld image blob cached successfully"
+                            );
+                            event_state
+                                .record_pull_event(
+                                    PullEvent::new(
+                                        "pulld_image_blob_cached",
+                                        image_clone.clone(),
+                                        format!("blob cached successfully size={}", total_bytes),
+                                    )
+                                    .method("GET")
+                                    .status(StatusCode::OK.to_string())
+                                    .cache("MISS")
+                                    .digest(digest_clone.clone()),
                                 )
-                                .method("GET")
-                                .status(StatusCode::OK.to_string())
-                                .cache("MISS")
-                                .digest(digest_clone.clone()),
-                            )
-                            .await;
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                event = "pulld_image_blob_cache_write_failed",
+                                image = %image_clone,
+                                digest = %digest_clone,
+                                error = %e,
+                                "Verified blob could not be committed to cache"
+                            );
+                            event_state
+                                .record_pull_event(
+                                    PullEvent::new(
+                                        "pulld_image_blob_cache_write_failed",
+                                        image_clone.clone(),
+                                        format!("blob cache write failed: {}", e),
+                                    )
+                                    .method("GET")
+                                    .digest(digest_clone.clone()),
+                                )
+                                .await;
+                            let _ = tokio::fs::remove_file(&temp_path).await;
+                        }
                     }
                 } else {
                     tracing::warn!(
@@ -893,18 +842,14 @@ pub async fn head_blob(
     tracing::debug!(name = %_name, digest = %digest, "HEAD blob request");
 
     let cache = &state.cache;
-    let blob_path = cache.blob_path(&digest);
 
-    // Check cache - use async metadata check for reliable filesystem state
-    if let Ok(metadata) = tokio::fs::metadata(&blob_path).await {
-        let size = metadata.len();
-        if size > 0 {
-            let mut headers = HeaderMap::new();
-            headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
-            headers.insert("Content-Length", size.to_string().parse().unwrap());
-            headers.insert("Docker-Content-Digest", digest.parse().unwrap());
-            return (StatusCode::OK, headers).into_response();
-        }
+    if let Some(size) = cache.blob_size(&digest).await.filter(|size| *size > 0) {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+        headers.insert("Content-Length", size.to_string().parse().unwrap());
+        headers.insert("Docker-Content-Digest", digest.parse().unwrap());
+        headers.insert("X-Cache", "HIT".parse().unwrap());
+        return (StatusCode::OK, headers).into_response();
     }
 
     // Not in cache - check upstream

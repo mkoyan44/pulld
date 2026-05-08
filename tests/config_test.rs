@@ -2,7 +2,7 @@
 //!
 //! Tests for mirror strategy parsing, registry config validation, and defaults.
 
-use pulld::config::{MirrorStrategy, RegistryConfig};
+use pulld::config::{CacheBackendKind, Config, MirrorStrategy, RegistryConfig};
 use std::str::FromStr;
 
 #[test]
@@ -112,4 +112,44 @@ mirrors = ["https://registry.example.com"]
 #[test]
 fn test_mirror_strategy_default() {
     assert_eq!(MirrorStrategy::default(), MirrorStrategy::Adaptive);
+}
+
+#[test]
+fn test_cache_backend_defaults_to_filesystem() {
+    let config = Config::default();
+
+    assert_eq!(config.cache.backend, CacheBackendKind::Filesystem);
+    assert!(config.cache.s3.is_none());
+}
+
+#[test]
+fn test_cache_backend_env_overrides_configure_s3_minio() {
+    let mut config = Config::default();
+    let vars = [
+        ("PULLD_CACHE_BACKEND", "s3"),
+        (
+            "PULLD_S3_ENDPOINT",
+            "http://minio.pulld.svc.cluster.local:9000",
+        ),
+        ("PULLD_S3_BUCKET", "pulld-cache"),
+        ("PULLD_S3_REGION", "us-east-1"),
+        ("PULLD_S3_FORCE_PATH_STYLE", "true"),
+        ("PULLD_S3_ACCESS_KEY_ID", "pulld"),
+        ("PULLD_S3_SECRET_ACCESS_KEY", "secret"),
+        ("PULLD_S3_PREFIX", "registry-cache"),
+        ("PULLD_S3_SCRATCH_DIR", "/tmp/pulld-cache"),
+    ];
+
+    config.apply_env_overrides(vars).unwrap();
+
+    assert_eq!(config.cache.backend, CacheBackendKind::S3);
+    assert_eq!(config.cache.directory, "/tmp/pulld-cache");
+    let s3 = config.cache.s3.as_ref().expect("s3 config");
+    assert_eq!(s3.endpoint, "http://minio.pulld.svc.cluster.local:9000");
+    assert_eq!(s3.bucket, "pulld-cache");
+    assert_eq!(s3.region, "us-east-1");
+    assert!(s3.force_path_style);
+    assert_eq!(s3.access_key_id, "pulld");
+    assert_eq!(s3.secret_access_key, "secret");
+    assert_eq!(s3.prefix, "registry-cache");
 }

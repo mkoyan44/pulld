@@ -45,7 +45,11 @@ spec:
           image: {{ include "pulld.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
+            {{- if eq .Values.cache.backend "s3" }}
+            - {{ .Values.s3.scratchDir | quote }}
+            {{- else }}
             - {{ .Values.cache.dir | quote }}
+            {{- end }}
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -53,10 +57,38 @@ spec:
             - name: http
               containerPort: 5050
               protocol: TCP
-          {{- with .Values.extraEnv }}
           env:
+            - name: PULLD_CACHE_BACKEND
+              value: {{ .Values.cache.backend | quote }}
+            {{- if eq .Values.cache.backend "s3" }}
+            - name: PULLD_S3_ENDPOINT
+              value: {{ required "s3.endpoint is required when cache.backend=s3" .Values.s3.endpoint | quote }}
+            - name: PULLD_S3_BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            - name: PULLD_S3_REGION
+              value: {{ .Values.s3.region | quote }}
+            - name: PULLD_S3_FORCE_PATH_STYLE
+              value: {{ .Values.s3.forcePathStyle | quote }}
+            - name: PULLD_S3_SCRATCH_DIR
+              value: {{ .Values.s3.scratchDir | quote }}
+            {{- if .Values.s3.prefix }}
+            - name: PULLD_S3_PREFIX
+              value: {{ .Values.s3.prefix | quote }}
+            {{- end }}
+            - name: PULLD_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "s3.existingSecret is required when cache.backend=s3" .Values.s3.existingSecret | quote }}
+                  key: {{ .Values.s3.accessKeyIdKey | quote }}
+            - name: PULLD_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "s3.existingSecret is required when cache.backend=s3" .Values.s3.existingSecret | quote }}
+                  key: {{ .Values.s3.secretAccessKeyKey | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
           {{- if .Values.probes.liveness.enabled }}
           livenessProbe:
             httpGet:
@@ -86,14 +118,17 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
+            {{- if ne .Values.cache.backend "s3" }}
             - name: cache
               mountPath: {{ .Values.cache.dir }}
+            {{- end }}
             - name: tmp
               mountPath: /tmp
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
       volumes:
+        {{- if ne .Values.cache.backend "s3" }}
         - name: cache
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
@@ -101,6 +136,7 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- end }}
         - name: tmp
           emptyDir: {}
         {{- with .Values.extraVolumes }}

@@ -8,32 +8,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulld=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let cache_dir = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| "./cache/pulld".to_string()),
-    );
+    let cache_dir_arg = std::env::args().nth(1);
 
     // Use compile-time default config with focused environment overrides.
     let mut config = Config::default();
-    if let Ok(port) = std::env::var("PULLD_HTTPS_PORT") {
-        config.server.port = port.parse()?;
-    }
-    if let Ok(http_port) = std::env::var("PULLD_HTTP_PORT") {
-        config.server.http_port = Some(http_port.parse()?);
-    }
-    if let (Ok(cert_path), Ok(key_path)) = (
-        std::env::var("PULLD_TLS_CERT_PATH"),
-        std::env::var("PULLD_TLS_KEY_PATH"),
-    ) {
-        config.server.tls = Some(pulld::config::TlsConfig {
-            enabled: true,
-            cert_path,
-            key_path,
-            client_auth: false,
-            client_ca_path: None,
-        });
-    }
+    config.apply_env_overrides(std::env::vars())?;
+    let cache_dir = PathBuf::from(cache_dir_arg.unwrap_or_else(|| config.cache.directory.clone()));
 
     tracing::info!(
         "Starting pulld server on {}:{}",
@@ -41,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.server.port
     );
     tracing::info!("Cache directory: {:?}", cache_dir);
+    tracing::info!("Cache backend: {:?}", config.cache.backend);
     tracing::info!("Using compile-time default configuration");
     if config
         .server
