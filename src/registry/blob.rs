@@ -1,3 +1,4 @@
+use crate::cache::storage::BlobByteRange;
 use crate::registry::manifest::{AppState, PullEvent};
 use crate::registry::upstream::UpstreamClient;
 use axum::{
@@ -27,13 +28,10 @@ pub async fn get_blob(
         "GET blob request"
     );
 
-    // Parse Range header from client (e.g. "bytes=1234-")
-    let client_range_start: Option<u64> = req_headers
+    let client_range = req_headers
         .get("range")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("bytes="))
-        .and_then(|s| s.strip_suffix('-'))
-        .and_then(|s| s.parse().ok());
+        .and_then(parse_range_header);
 
     let (registry, repository) = crate::registry::manifest::parse_repository(&_name);
     let image = format!("{}@{}", _name, digest);
@@ -52,11 +50,13 @@ pub async fn get_blob(
         "Checking cache for blob"
     );
 
-    match cache.open_blob(&digest, client_range_start).await {
+    match cache.open_blob(&digest, client_range).await {
         Ok(Some(cached_blob)) => {
             let start = cached_blob.range_start.unwrap_or(0);
-            let remaining = cached_blob.size - start;
-            let cache_status = if start > 0 {
+            let end = cached_blob.range_end.unwrap_or(cached_blob.size - 1);
+            let remaining = end - start + 1;
+            let is_range_response = cached_blob.range_start.is_some();
+            let cache_status = if is_range_response {
                 StatusCode::PARTIAL_CONTENT
             } else {
                 StatusCode::OK
@@ -91,17 +91,12 @@ pub async fn get_blob(
             headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
             headers.insert("Content-Length", remaining.to_string().parse().unwrap());
             headers.insert("X-Cache", "HIT".parse().unwrap());
-            if start > 0 {
+            if is_range_response {
                 headers.insert(
                     "Content-Range",
-                    format!(
-                        "bytes {}-{}/{}",
-                        start,
-                        cached_blob.size - 1,
-                        cached_blob.size
-                    )
-                    .parse()
-                    .unwrap(),
+                    format!("bytes {}-{}/{}", start, end, cached_blob.size)
+                        .parse()
+                        .unwrap(),
                 );
                 return (StatusCode::PARTIAL_CONTENT, headers, cached_blob.body).into_response();
             }
@@ -1046,4 +1041,19 @@ async fn fetch_blob_size_from_get(
             .and_then(|s| s.parse::<u64>().ok()),
         _ => None,
     }
+}
+
+fn parse_range_header(value: &str) -> Option<BlobByteRange> {
+    let value = value.trim().strip_prefix("bytes=")?;
+    let (start, end) = value.split_once('-')?;
+    if start.is_empty() {
+        return None;
+    }
+    let start = start.parse().ok()?;
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(end.parse().ok()?)
+    };
+    Some(BlobByteRange { start, end })
 }

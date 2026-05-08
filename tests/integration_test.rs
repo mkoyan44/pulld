@@ -1052,6 +1052,7 @@ async fn test_head_blob_returns_content_length() {
 
 /// Test Helm chart caching - verify charts are cached on first request and served from cache on subsequent requests
 #[tokio::test]
+#[ignore = "requires external Helm repository access"]
 async fn test_helm_chart_caching() {
     init_test_tracing();
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -1139,6 +1140,7 @@ async fn test_helm_chart_caching() {
 
 /// Test Helm chart prepull functionality
 #[tokio::test]
+#[ignore = "requires external Helm repository access"]
 async fn test_helm_chart_prepull() {
     init_test_tracing();
     let temp_dir = TempDir::new().expect("Failed to create temp directory");

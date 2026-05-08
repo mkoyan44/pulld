@@ -230,3 +230,56 @@ async fn test_blob_streaming_complete_download() {
 
     // Test passed: Cached blob served with Content-Length
 }
+
+#[tokio::test]
+async fn test_cached_blob_range_request_returns_partial_content() {
+    use sha2::{Digest, Sha256};
+
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let cache_dir = temp_dir.path().join("cache");
+    let cache = Arc::new(
+        pulld::cache::CacheStorage::with_max_size(cache_dir.clone(), Some(1))
+            .expect("Failed to create cache storage"),
+    );
+
+    let test_blob_data: Vec<u8> = (0..=255).cycle().take(1024).collect();
+    let mut hasher = Sha256::new();
+    hasher.update(&test_blob_data);
+    let test_digest = format!("sha256:{:x}", hasher.finalize());
+
+    cache
+        .write_blob(&test_digest, &test_blob_data)
+        .await
+        .expect("Failed to write test blob to cache");
+
+    let mut config = Config::default();
+    config.server.port = 5064;
+
+    let _server_handle = start_server(cache_dir.clone(), config.clone(), None, None)
+        .await
+        .expect("Failed to start pulld server");
+    sleep(Duration::from_secs(1)).await;
+
+    let client = reqwest::Client::new();
+    let blob_url = format!(
+        "http://localhost:{}/v2/test-registry.io/test-repo/blobs/{}",
+        config.server.port, test_digest
+    );
+
+    let response = client
+        .get(&blob_url)
+        .header("Range", "bytes=10-63")
+        .send()
+        .await
+        .expect("Failed to send ranged blob request");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get("content-range").unwrap(),
+        "bytes 10-63/1024"
+    );
+    assert_eq!(response.headers().get("content-length").unwrap(), "54");
+
+    let bytes = response.bytes().await.expect("Failed to read body");
+    assert_eq!(bytes.as_ref(), &test_blob_data[10..=63]);
+}
