@@ -44,6 +44,9 @@ pub struct CachedBlob {
     pub body: Body,
 }
 
+const S3_MULTIPART_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+const S3_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
 /// Content-addressable blob storage
 pub struct CacheStorage {
     base_dir: PathBuf,
@@ -516,13 +519,18 @@ impl CacheStorage {
         mut reader: R,
     ) -> Result<u64> {
         if let CacheBackend::ObjectStore { store, .. } = &self.backend {
-            let key = self.blob_object_key(digest);
-            let path = ObjectPath::from(key);
-            let mut upload = store.put_multipart(&path).await.map_err(|e| {
-                DockerProxyError::Cache(format!("Failed to start S3 blob upload {}: {}", digest, e))
+            let temp_path = self.blob_upload_temp_path(digest);
+            if let Some(parent) = temp_path.parent() {
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to create blob dir: {}", e))
+                })?;
+            }
+
+            let mut file = fs::File::create(&temp_path).await.map_err(|e| {
+                DockerProxyError::Cache(format!("Failed to create blob temp file: {}", e))
             })?;
             let mut written = 0u64;
-            let mut buffer = vec![0u8; 8 * 1024 * 1024];
+            let mut buffer = vec![0u8; 8192];
 
             loop {
                 let n = reader.read(&mut buffer).await.map_err(|e| {
@@ -532,24 +540,20 @@ impl CacheStorage {
                     break;
                 }
                 written += n as u64;
-                upload
-                    .put_part(Bytes::copy_from_slice(&buffer[..n]).into())
-                    .await
-                    .map_err(|e| {
-                        DockerProxyError::Cache(format!(
-                            "Failed to upload S3 blob part {}: {}",
-                            digest, e
-                        ))
-                    })?;
-            }
-
-            if written == 0 {
-                object_put(store.as_ref(), &self.blob_object_key(digest), Bytes::new()).await?;
-            } else {
-                upload.complete().await.map_err(|e| {
-                    DockerProxyError::Cache(format!("Failed to complete S3 blob {}: {}", digest, e))
+                file.write_all(&buffer[..n]).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to write blob temp file: {}", e))
                 })?;
             }
+
+            file.sync_all()
+                .await
+                .map_err(|e| DockerProxyError::Cache(format!("Failed to sync blob: {}", e)))?;
+            drop(file);
+
+            let key = self.blob_object_key(digest);
+            let upload_result = object_put_file(store.as_ref(), &key, digest, &temp_path).await;
+            let _ = fs::remove_file(&temp_path).await;
+            upload_result?;
             return Ok(written);
         }
 
@@ -613,15 +617,9 @@ impl CacheStorage {
                     DockerProxyError::Cache(format!("Failed to commit blob {}: {}", digest, e))
                 })?;
             }
-            CacheBackend::ObjectStore { .. } => {
-                let file = fs::File::open(temp_path).await.map_err(|e| {
-                    DockerProxyError::Cache(format!(
-                        "Failed to open verified blob temp file {}: {}",
-                        temp_path.display(),
-                        e
-                    ))
-                })?;
-                self.write_blob_stream(digest, file).await?;
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.blob_object_key(digest);
+                object_put_file(store.as_ref(), &key, digest, temp_path).await?;
                 let _ = fs::remove_file(temp_path).await;
             }
         }
@@ -1207,6 +1205,20 @@ impl CacheStorage {
         );
         segments.join("/")
     }
+
+    fn blob_upload_temp_path(&self, digest: &str) -> PathBuf {
+        let digest = digest.strip_prefix("sha256:").unwrap_or(digest);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        self.blobs_dir.join(format!(
+            "{}.{}.{}.upload.tmp",
+            digest,
+            std::process::id(),
+            timestamp
+        ))
+    }
 }
 
 fn normalize_prefix(prefix: &str) -> String {
@@ -1250,6 +1262,93 @@ async fn object_put(store: &dyn ObjectStore, key: &str, data: Bytes) -> Result<(
         .await
         .map(|_| ())
         .map_err(|e| object_error("write", key, e))
+}
+
+async fn object_put_file(
+    store: &dyn ObjectStore,
+    key: &str,
+    digest: &str,
+    file_path: &Path,
+) -> Result<u64> {
+    let size = fs::metadata(file_path)
+        .await
+        .map_err(|e| {
+            DockerProxyError::Cache(format!(
+                "Failed to stat verified blob temp file {}: {}",
+                file_path.display(),
+                e
+            ))
+        })?
+        .len();
+
+    if size < S3_MULTIPART_MIN_PART_SIZE {
+        let data = fs::read(file_path).await.map_err(|e| {
+            DockerProxyError::Cache(format!(
+                "Failed to read verified blob temp file {}: {}",
+                file_path.display(),
+                e
+            ))
+        })?;
+        object_put(store, key, Bytes::from(data)).await?;
+        return Ok(size);
+    }
+
+    let path = ObjectPath::from(key.to_string());
+    let mut upload = store.put_multipart(&path).await.map_err(|e| {
+        DockerProxyError::Cache(format!("Failed to start S3 blob upload {}: {}", digest, e))
+    })?;
+    let mut file = fs::File::open(file_path).await.map_err(|e| {
+        DockerProxyError::Cache(format!(
+            "Failed to open verified blob temp file {}: {}",
+            file_path.display(),
+            e
+        ))
+    })?;
+    let mut written = 0u64;
+    let mut buffer = vec![0u8; S3_MULTIPART_CHUNK_SIZE];
+
+    loop {
+        let n = file.read(&mut buffer).await.map_err(|e| {
+            DockerProxyError::Cache(format!(
+                "Failed to read verified blob temp file {}: {}",
+                file_path.display(),
+                e
+            ))
+        })?;
+        if n == 0 {
+            break;
+        }
+
+        written += n as u64;
+        if let Err(e) = upload
+            .put_part(Bytes::copy_from_slice(&buffer[..n]).into())
+            .await
+        {
+            let _ = upload.abort().await;
+            return Err(DockerProxyError::Cache(format!(
+                "Failed to upload S3 blob part {}: {}",
+                digest, e
+            )));
+        }
+    }
+
+    if written != size {
+        let _ = upload.abort().await;
+        return Err(DockerProxyError::Cache(format!(
+            "Failed to upload S3 blob {}: expected {} bytes but read {}",
+            digest, size, written
+        )));
+    }
+
+    if let Err(e) = upload.complete().await {
+        let _ = upload.abort().await;
+        return Err(DockerProxyError::Cache(format!(
+            "Failed to complete S3 blob {}: {}",
+            digest, e
+        )));
+    }
+
+    Ok(written)
 }
 
 async fn object_delete(store: &dyn ObjectStore, key: &str) -> Result<()> {

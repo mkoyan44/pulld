@@ -16,9 +16,20 @@ struct FailingPutStore {
     inner: InMemory,
 }
 
+#[derive(Debug)]
+struct FailingMultipartStore {
+    inner: InMemory,
+}
+
 impl Display for FailingPutStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "failing-put-store")
+    }
+}
+
+impl Display for FailingMultipartStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failing-multipart-store")
     }
 }
 
@@ -44,6 +55,67 @@ impl ObjectStore for FailingPutStore {
         Err(object_store::Error::Generic {
             store: "failing-put-store",
             source: Box::new(io::Error::other("simulated multipart failure")),
+        })
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+    ) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FailingMultipartStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _location: &ObjectPath,
+        _opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        Err(object_store::Error::Generic {
+            store: "failing-multipart-store",
+            source: Box::new(io::Error::other("multipart upload should not be used")),
         })
     }
 
@@ -117,6 +189,36 @@ async fn s3_backend_uses_stable_content_addressed_keys() {
         cache.chart_object_key("cilium", "cilium-1.17.7.tgz"),
         "pulld-cache/charts/cilium/cilium-1.17.7.tgz"
     );
+}
+
+#[tokio::test]
+async fn s3_backend_commits_small_temp_blob_without_multipart() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let cache = CacheStorage::with_object_store(
+        temp_dir.path().to_path_buf(),
+        Arc::new(FailingMultipartStore {
+            inner: InMemory::new(),
+        }) as Arc<dyn ObjectStore>,
+        String::new(),
+        Some(1),
+    )
+    .expect("cache storage");
+    let temp_blob = temp_dir.path().join("small-blob.tmp");
+
+    tokio::fs::write(&temp_blob, b"small layer")
+        .await
+        .expect("write temp blob");
+
+    cache
+        .commit_blob_from_temp("sha256:smallblob", &temp_blob)
+        .await
+        .expect("commit small blob");
+
+    assert_eq!(
+        cache.read_blob("sha256:smallblob").await.unwrap(),
+        b"small layer"
+    );
+    assert!(!temp_blob.exists());
 }
 
 #[tokio::test]
