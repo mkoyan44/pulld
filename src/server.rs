@@ -371,6 +371,7 @@ fn build_router(app_state: crate::registry::manifest::AppState) -> Router {
         .route("/api/v1/cache/stats", get(cache_stats))
         .route("/api/v1/mirror/stats", get(mirror_stats))
         .route("/api/v1/pull-events", get(pull_events))
+        .route("/metrics", get(metrics))
         .route("/health", get(health))
         .with_state(app_state)
 }
@@ -512,6 +513,7 @@ pub async fn start_server(
         proxy_port,
         proxy_scheme,
         pull_events: Arc::new(crate::registry::manifest::PullEventLog::default()),
+        pull_metrics: Arc::new(crate::registry::manifest::PullMetrics::default()),
     };
 
     let bind_address = config.server.bind_address.clone();
@@ -694,6 +696,19 @@ async fn mutate_pods(Json(review): Json<crate::admission::AdmissionReview>) -> i
 async fn health() -> impl IntoResponse {
     tracing::debug!("GET /health - Health check request");
     (StatusCode::OK, "ok")
+}
+
+async fn metrics(State(state): State<crate::registry::manifest::AppState>) -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state
+            .pull_metrics
+            .render_prometheus(&state.pull_events)
+            .await,
+    )
 }
 
 #[derive(Deserialize)]

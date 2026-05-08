@@ -14,9 +14,9 @@ use axum::{
 use reqwest::Client;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock as TokioRwLock;
 
@@ -123,6 +123,18 @@ impl PullEventLog {
             .cloned()
             .collect()
     }
+
+    pub async fn len(&self) -> usize {
+        self.events.read().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.events.read().await.is_empty()
+    }
+
+    pub fn latest_sequence(&self) -> u64 {
+        self.next_sequence.load(Ordering::Relaxed).saturating_sub(1)
+    }
 }
 
 impl Default for PullEventLog {
@@ -131,9 +143,93 @@ impl Default for PullEventLog {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PullMetricKey {
+    event: String,
+    method: String,
+    status: String,
+    cache: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PullMetrics {
+    events_total: Arc<Mutex<BTreeMap<PullMetricKey, u64>>>,
+}
+
+impl PullMetrics {
+    pub fn record(&self, event: &PullEvent) {
+        let key = PullMetricKey {
+            event: event.event.clone(),
+            method: event.method.clone().unwrap_or_else(|| "-".to_string()),
+            status: event
+                .status
+                .as_deref()
+                .map(|status| status.replace(' ', "_"))
+                .unwrap_or_else(|| "-".to_string()),
+            cache: event.cache.clone().unwrap_or_else(|| "-".to_string()),
+        };
+
+        let mut events_total = self
+            .events_total
+            .lock()
+            .expect("pull metrics lock poisoned");
+        *events_total.entry(key).or_insert(0) += 1;
+    }
+
+    pub async fn render_prometheus(&self, event_log: &PullEventLog) -> String {
+        use std::fmt::Write;
+
+        let events_total = self
+            .events_total
+            .lock()
+            .expect("pull metrics lock poisoned")
+            .clone();
+        let mut output = String::new();
+
+        output.push_str("# HELP pulld_pull_events_total Pull events recorded by pulld.\n");
+        output.push_str("# TYPE pulld_pull_events_total counter\n");
+        for (key, total) in events_total {
+            let _ = writeln!(
+                output,
+                "pulld_pull_events_total{{event=\"{}\",method=\"{}\",status=\"{}\",cache=\"{}\"}} {}",
+                prometheus_label_value(&key.event),
+                prometheus_label_value(&key.method),
+                prometheus_label_value(&key.status),
+                prometheus_label_value(&key.cache),
+                total
+            );
+        }
+
+        output.push_str("# HELP pulld_pull_event_buffer_size Pull events retained in the in-memory event buffer.\n");
+        output.push_str("# TYPE pulld_pull_event_buffer_size gauge\n");
+        let _ = writeln!(
+            output,
+            "pulld_pull_event_buffer_size {}",
+            event_log.len().await
+        );
+
+        output.push_str("# HELP pulld_pull_event_latest_sequence Latest pull event sequence number recorded by pulld.\n");
+        output.push_str("# TYPE pulld_pull_event_latest_sequence gauge\n");
+        let _ = writeln!(
+            output,
+            "pulld_pull_event_latest_sequence {}",
+            event_log.latest_sequence()
+        );
+
+        output
+    }
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', " ")
+}
+
 #[cfg(test)]
 mod pull_event_tests {
-    use super::{PullEvent, PullEventLog};
+    use super::{PullEvent, PullEventLog, PullMetrics};
 
     fn event(name: &str) -> PullEvent {
         PullEvent {
@@ -176,6 +272,32 @@ mod pull_event_tests {
         assert_eq!(events[0].event, "second");
         assert_eq!(events[1].event, "third");
     }
+
+    #[tokio::test]
+    async fn pull_metrics_render_prometheus_counters() {
+        let log = PullEventLog::new(8);
+        let metrics = PullMetrics::default();
+        let event = PullEvent::new(
+            "pulld_image_blob_response_opened",
+            "docker.io/library/alpine@sha256:test",
+            "blob response opened",
+        )
+        .method("GET")
+        .status("200 OK")
+        .cache("MISS");
+
+        metrics.record(&event);
+        log.record(event).await;
+
+        let output = metrics.render_prometheus(&log).await;
+
+        assert!(output.contains("# TYPE pulld_pull_events_total counter"));
+        assert!(output.contains(
+            "pulld_pull_events_total{event=\"pulld_image_blob_response_opened\",method=\"GET\",status=\"200_OK\",cache=\"MISS\"} 1"
+        ));
+        assert!(output.contains("pulld_pull_event_buffer_size 1"));
+        assert!(output.contains("pulld_pull_event_latest_sequence 1"));
+    }
 }
 
 #[derive(Clone)]
@@ -194,10 +316,12 @@ pub struct AppState {
     pub proxy_port: u16,
     pub proxy_scheme: String,
     pub pull_events: Arc<PullEventLog>,
+    pub pull_metrics: Arc<PullMetrics>,
 }
 
 impl AppState {
     pub async fn record_pull_event(&self, event: PullEvent) {
+        self.pull_metrics.record(&event);
         self.pull_events.record(event).await;
     }
 
