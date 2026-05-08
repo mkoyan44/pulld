@@ -4,7 +4,7 @@
 
 use pulld::cache::CacheStorage;
 use pulld::config::{UpstreamTlsConfig, DEFAULT_REGISTRY_URL};
-use pulld::registry::manifest::{parse_repository, AppState, TokenCache};
+use pulld::registry::manifest::{parse_repository, AppState, PullEventLog, TokenCache};
 use pulld::registry::upstream::UpstreamClient;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,6 +72,7 @@ async fn test_get_upstream_client_auto_detection() {
         proxy_host: "pulld.internal".to_string(),
         proxy_port: 5050,
         proxy_scheme: "http".to_string(),
+        pull_events: Arc::new(PullEventLog::default()),
     };
 
     // Test auto-detection for unconfigured registry
@@ -128,6 +129,7 @@ fn test_get_registry_config_auto_detection() {
         proxy_host: "pulld.internal".to_string(),
         proxy_port: 5050,
         proxy_scheme: "http".to_string(),
+        pull_events: Arc::new(PullEventLog::default()),
     };
 
     // Test auto-detection for unconfigured registry
@@ -782,6 +784,7 @@ async fn test_quay_io_cilium_upstream_client_auto_detection() {
         proxy_host: "pulld.internal".to_string(),
         proxy_port: 5050,
         proxy_scheme: "http".to_string(),
+        pull_events: Arc::new(PullEventLog::default()),
     };
 
     // Test auto-detection for quay.io

@@ -1,4 +1,4 @@
-use crate::registry::manifest::AppState;
+use crate::registry::manifest::{AppState, PullEvent};
 use crate::registry::upstream::UpstreamClient;
 use axum::{
     body::Body,
@@ -279,6 +279,17 @@ pub async fn get_blob(
         range = %range_header.as_deref().unwrap_or("not-set"),
         "Pulld upstream image blob pull started"
     );
+    state
+        .record_pull_event(
+            PullEvent::new(
+                "pulld_upstream_blob_pull_start",
+                image.clone(),
+                "upstream blob pull started",
+            )
+            .method("GET")
+            .digest(digest.clone()),
+        )
+        .await;
     let mut response = match crate::registry::race_mirrors(
         &upstream_client,
         mirrors,
@@ -303,17 +314,46 @@ pub async fn get_blob(
                 status = %status,
                 "Pulld upstream image blob pull response received"
             );
+            state
+                .record_pull_event(
+                    PullEvent::new(
+                        "pulld_upstream_blob_pull_response",
+                        image.clone(),
+                        "upstream blob pull response received",
+                    )
+                    .method("GET")
+                    .status(status.to_string())
+                    .digest(digest.clone()),
+                )
+                .await;
             resp
         }
         Err(e) => {
+            let error_message = e.to_string();
             tracing::error!(
                 event = "pulld_upstream_blob_pull_error",
                 image = %image,
                 digest = %digest,
-                error = %e,
+                error = %error_message,
                 "Failed to fetch blob from upstream"
             );
-            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
+            state
+                .record_pull_event(
+                    PullEvent::new(
+                        "pulld_upstream_blob_pull_error",
+                        image,
+                        format!("upstream blob pull error: {}", error_message),
+                    )
+                    .method("GET")
+                    .status(StatusCode::BAD_GATEWAY.to_string())
+                    .digest(digest),
+                )
+                .await;
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream error: {}", error_message),
+            )
+                .into_response();
         }
     };
 
@@ -651,6 +691,7 @@ pub async fn get_blob(
     let cache_clone = cache.clone();
     let digest_clone = digest.to_string();
     let image_clone = image.clone();
+    let event_state = state.clone();
     let expected_size = content_length;
 
     // Create a channel to tee the stream
@@ -719,18 +760,44 @@ pub async fn get_blob(
                             bytes_streamed = total_bytes,
                             "Client disconnected while Pulld was streaming image blob"
                         );
+                        event_state
+                            .record_pull_event(
+                                PullEvent::new(
+                                    "pulld_image_blob_client_disconnected",
+                                    image_clone.clone(),
+                                    format!("client disconnected after {} bytes", total_bytes),
+                                )
+                                .method("GET")
+                                .digest(digest_clone.clone()),
+                            )
+                            .await;
                         break; // Client disconnected
                     }
                 }
                 Err(e) => {
+                    let error_message = e.to_string();
                     tracing::error!(
                         event = "pulld_image_blob_stream_error",
                         image = %image_clone,
                         digest = %digest_clone,
-                        error = %e,
+                        error = %error_message,
                         total_bytes = total_bytes,
                         "Upstream stream error - preserving partial file for resume"
                     );
+                    event_state
+                        .record_pull_event(
+                            PullEvent::new(
+                                "pulld_image_blob_stream_error",
+                                image_clone.clone(),
+                                format!(
+                                    "upstream stream error after {} bytes: {}",
+                                    total_bytes, error_message
+                                ),
+                            )
+                            .method("GET")
+                            .digest(digest_clone.clone()),
+                        )
+                        .await;
                     let _ = tx.send(Err(std::io::Error::other(e))).await;
                     // Preserve partial cache file for resume (don't delete)
                     // The file will be used to resume on next attempt
@@ -757,6 +824,19 @@ pub async fn get_blob(
                             size = total_bytes,
                             "Pulld image blob cached successfully"
                         );
+                        event_state
+                            .record_pull_event(
+                                PullEvent::new(
+                                    "pulld_image_blob_cached",
+                                    image_clone.clone(),
+                                    format!("blob cached successfully size={}", total_bytes),
+                                )
+                                .method("GET")
+                                .status(StatusCode::OK.to_string())
+                                .cache("MISS")
+                                .digest(digest_clone.clone()),
+                            )
+                            .await;
                     }
                 } else {
                     tracing::warn!(
@@ -769,6 +849,20 @@ pub async fn get_blob(
                         actual_size = total_bytes,
                         "Blob verification failed - not caching"
                     );
+                    event_state
+                        .record_pull_event(
+                            PullEvent::new(
+                                "pulld_image_blob_verification_failed",
+                                image_clone.clone(),
+                                format!(
+                                    "blob verification failed actual_size={} calculated_digest={}",
+                                    total_bytes, calculated_digest
+                                ),
+                            )
+                            .method("GET")
+                            .digest(digest_clone.clone()),
+                        )
+                        .await;
                     let _ = tokio::fs::remove_file(&temp_path).await;
                 }
             } else {

@@ -5,11 +5,12 @@ use crate::config::{
 };
 use crate::error::{DockerProxyError, Result};
 use crate::helm::{get_chart, get_index};
+use crate::registry::manifest::PullEvent;
 use crate::registry::{get_blob, get_manifest, head_blob, head_manifest, UpstreamClient};
 use crate::tls::{create_server_tls_config, create_server_tls_config_from_pem};
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode, Uri},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -33,6 +34,14 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("not-set")
+}
+
+fn event_value(value: Option<&String>) -> &str {
+    value.map(String::as_str).unwrap_or("-")
+}
+
+fn event_status_value(value: Option<&String>) -> String {
+    event_value(value).replace(' ', "_")
 }
 
 // Wrapper functions to parse multi-segment paths for manifests and blobs
@@ -93,6 +102,17 @@ async fn get_v2_wrapper(
             user_agent = %header_str(&headers, "user-agent"),
             "Pulld image pull manifest request started"
         );
+        state
+            .record_pull_event(
+                PullEvent::new(
+                    "pulld_image_manifest_start",
+                    image.clone(),
+                    "manifest request started",
+                )
+                .method("GET")
+                .digest(reference.clone()),
+            )
+            .await;
 
         tracing::debug!(
             name = %name,
@@ -101,7 +121,7 @@ async fn get_v2_wrapper(
         );
 
         // Handle manifest request - get_manifest can handle both tags and digests
-        let response = get_manifest(State(state), Path((name, reference)), headers)
+        let response = get_manifest(State(state.clone()), Path((name, reference)), headers)
             .await
             .into_response();
         let status = response.status();
@@ -114,6 +134,18 @@ async fn get_v2_wrapper(
             elapsed_ms = elapsed_ms,
             "Pulld image pull manifest request completed"
         );
+        state
+            .record_pull_event(
+                PullEvent::new(
+                    "pulld_image_manifest_complete",
+                    image,
+                    "manifest request completed",
+                )
+                .method("GET")
+                .status(status.to_string())
+                .elapsed_ms(elapsed_ms),
+            )
+            .await;
         response
     }
     // Handle blobs: /v2/library/alpine/blobs/sha256:...
@@ -139,18 +171,29 @@ async fn get_v2_wrapper(
             range = %header_str(&headers, "range"),
             "Pulld image pull blob request started"
         );
+        state
+            .record_pull_event(
+                PullEvent::new(
+                    "pulld_image_blob_start",
+                    image.clone(),
+                    "blob request started",
+                )
+                .method("GET")
+                .digest(digest.clone()),
+            )
+            .await;
 
         tracing::debug!(
             name = %name,
             digest = %digest,
             "Parsed blob request from path"
         );
-        let response = get_blob(State(state), Path((name, digest)), headers)
+        let response = get_blob(State(state.clone()), Path((name, digest)), headers)
             .await
             .into_response();
         let status = response.status();
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let cache = header_str(response.headers(), "x-cache");
+        let cache = header_str(response.headers(), "x-cache").to_string();
         tracing::info!(
             event = "pulld_image_blob_response_opened",
             method = "GET",
@@ -160,6 +203,19 @@ async fn get_v2_wrapper(
             elapsed_ms = elapsed_ms,
             "Pulld image pull blob response opened"
         );
+        state
+            .record_pull_event(
+                PullEvent::new(
+                    "pulld_image_blob_response_opened",
+                    image,
+                    "blob response opened",
+                )
+                .method("GET")
+                .status(status.to_string())
+                .cache(cache)
+                .elapsed_ms(elapsed_ms),
+            )
+            .await;
         response
     } else {
         (StatusCode::BAD_REQUEST, "Invalid v2 path").into_response()
@@ -205,9 +261,20 @@ async fn head_v2_wrapper(
             reference = %reference,
             "Pulld image pull manifest request started"
         );
+        state
+            .record_pull_event(
+                PullEvent::new(
+                    "pulld_image_manifest_start",
+                    image.clone(),
+                    "manifest request started",
+                )
+                .method("HEAD")
+                .digest(reference.clone()),
+            )
+            .await;
 
         // Handle HEAD manifest request - head_manifest can handle both tags and digests
-        let response = head_manifest(State(state), Path((name, reference)))
+        let response = head_manifest(State(state.clone()), Path((name, reference)))
             .await
             .into_response();
         let status = response.status();
@@ -220,6 +287,18 @@ async fn head_v2_wrapper(
             elapsed_ms = elapsed_ms,
             "Pulld image pull manifest request completed"
         );
+        state
+            .record_pull_event(
+                PullEvent::new(
+                    "pulld_image_manifest_complete",
+                    image,
+                    "manifest request completed",
+                )
+                .method("HEAD")
+                .status(status.to_string())
+                .elapsed_ms(elapsed_ms),
+            )
+            .await;
         response
     } else if let Some(blobs_idx) = path.rfind(BLOBS_SUFFIX) {
         let name = path[V2_PREFIX.len()..blobs_idx].to_string();
@@ -240,12 +319,23 @@ async fn head_v2_wrapper(
             digest = %digest,
             "Pulld image pull blob request started"
         );
-        let response = head_blob(State(state), Path((name, digest)))
+        state
+            .record_pull_event(
+                PullEvent::new(
+                    "pulld_image_blob_start",
+                    image.clone(),
+                    "blob request started",
+                )
+                .method("HEAD")
+                .digest(digest.clone()),
+            )
+            .await;
+        let response = head_blob(State(state.clone()), Path((name, digest)))
             .await
             .into_response();
         let status = response.status();
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let cache = header_str(response.headers(), "x-cache");
+        let cache = header_str(response.headers(), "x-cache").to_string();
         tracing::info!(
             event = "pulld_image_blob_complete",
             method = "HEAD",
@@ -255,6 +345,15 @@ async fn head_v2_wrapper(
             elapsed_ms = elapsed_ms,
             "Pulld image pull blob request completed"
         );
+        state
+            .record_pull_event(
+                PullEvent::new("pulld_image_blob_complete", image, "blob request completed")
+                    .method("HEAD")
+                    .status(status.to_string())
+                    .cache(cache)
+                    .elapsed_ms(elapsed_ms),
+            )
+            .await;
         response
     } else {
         (StatusCode::BAD_REQUEST, "Invalid v2 path").into_response()
@@ -271,6 +370,7 @@ fn build_router(app_state: crate::registry::manifest::AppState) -> Router {
         .route("/api/v1/pre-pull", post(pre_pull))
         .route("/api/v1/cache/stats", get(cache_stats))
         .route("/api/v1/mirror/stats", get(mirror_stats))
+        .route("/api/v1/pull-events", get(pull_events))
         .route("/health", get(health))
         .with_state(app_state)
 }
@@ -411,6 +511,7 @@ pub async fn start_server(
         proxy_host: "pulld.internal".to_string(),
         proxy_port,
         proxy_scheme,
+        pull_events: Arc::new(crate::registry::manifest::PullEventLog::default()),
     };
 
     let bind_address = config.server.bind_address.clone();
@@ -593,6 +694,42 @@ async fn mutate_pods(Json(review): Json<crate::admission::AdmissionReview>) -> i
 async fn health() -> impl IntoResponse {
     tracing::debug!("GET /health - Health check request");
     (StatusCode::OK, "ok")
+}
+
+#[derive(Deserialize)]
+struct PullEventsQuery {
+    after: Option<u64>,
+}
+
+async fn pull_events(
+    State(state): State<crate::registry::manifest::AppState>,
+    Query(query): Query<PullEventsQuery>,
+) -> impl IntoResponse {
+    let events = state.pull_events.after(query.after.unwrap_or(0)).await;
+    let mut body = String::new();
+
+    for event in events {
+        use std::fmt::Write;
+        let _ = writeln!(
+            body,
+            "{} {} event={} image={} method={} status={} cache={} digest={} elapsed_ms={} message={}",
+            event.sequence,
+            event.timestamp,
+            event.event,
+            event.image,
+            event_value(event.method.as_ref()),
+            event_status_value(event.status.as_ref()),
+            event_value(event.cache.as_ref()),
+            event_value(event.digest.as_ref()),
+            event
+                .elapsed_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            event.message
+        );
+    }
+
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body)
 }
 
 #[derive(Deserialize)]

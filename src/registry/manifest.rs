@@ -12,11 +12,171 @@ use axum::{
     response::IntoResponse,
 };
 use reqwest::Client;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock as TokioRwLock;
+
+const DEFAULT_PULL_EVENT_CAPACITY: usize = 512;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PullEvent {
+    pub sequence: u64,
+    pub timestamp: String,
+    pub event: String,
+    pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    pub message: String,
+}
+
+impl PullEvent {
+    pub fn new(
+        event: impl Into<String>,
+        image: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            sequence: 0,
+            timestamp: String::new(),
+            event: event.into(),
+            image: image.into(),
+            method: None,
+            status: None,
+            cache: None,
+            digest: None,
+            elapsed_ms: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn method(mut self, method: &str) -> Self {
+        self.method = Some(method.to_string());
+        self
+    }
+
+    pub fn status(mut self, status: impl Into<String>) -> Self {
+        self.status = Some(status.into());
+        self
+    }
+
+    pub fn cache(mut self, cache: impl Into<String>) -> Self {
+        self.cache = Some(cache.into());
+        self
+    }
+
+    pub fn digest(mut self, digest: impl Into<String>) -> Self {
+        self.digest = Some(digest.into());
+        self
+    }
+
+    pub fn elapsed_ms(mut self, elapsed_ms: u64) -> Self {
+        self.elapsed_ms = Some(elapsed_ms);
+        self
+    }
+}
+
+#[derive(Debug)]
+pub struct PullEventLog {
+    capacity: usize,
+    next_sequence: AtomicU64,
+    events: TokioRwLock<VecDeque<PullEvent>>,
+}
+
+impl PullEventLog {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            next_sequence: AtomicU64::new(1),
+            events: TokioRwLock::new(VecDeque::with_capacity(capacity.max(1))),
+        }
+    }
+
+    pub async fn record(&self, mut event: PullEvent) {
+        event.sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        event.timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let mut events = self.events.write().await;
+        if events.len() >= self.capacity {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    pub async fn after(&self, sequence: u64) -> Vec<PullEvent> {
+        self.events
+            .read()
+            .await
+            .iter()
+            .filter(|event| event.sequence > sequence)
+            .cloned()
+            .collect()
+    }
+}
+
+impl Default for PullEventLog {
+    fn default() -> Self {
+        Self::new(DEFAULT_PULL_EVENT_CAPACITY)
+    }
+}
+
+#[cfg(test)]
+mod pull_event_tests {
+    use super::{PullEvent, PullEventLog};
+
+    fn event(name: &str) -> PullEvent {
+        PullEvent {
+            sequence: 0,
+            timestamp: String::new(),
+            event: name.to_string(),
+            image: "docker.io/library/alpine:3.20".to_string(),
+            method: Some("GET".to_string()),
+            status: None,
+            cache: None,
+            digest: None,
+            elapsed_ms: None,
+            message: "test event".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_event_log_returns_events_after_sequence() {
+        let log = PullEventLog::new(8);
+        log.record(event("first")).await;
+        log.record(event("second")).await;
+
+        let events = log.after(1).await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].event, "second");
+    }
+
+    #[tokio::test]
+    async fn pull_event_log_keeps_bounded_history() {
+        let log = PullEventLog::new(2);
+        log.record(event("first")).await;
+        log.record(event("second")).await;
+        log.record(event("third")).await;
+
+        let events = log.after(0).await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "second");
+        assert_eq!(events[1].event, "third");
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,9 +193,14 @@ pub struct AppState {
     pub proxy_host: String,
     pub proxy_port: u16,
     pub proxy_scheme: String,
+    pub pull_events: Arc<PullEventLog>,
 }
 
 impl AppState {
+    pub async fn record_pull_event(&self, event: PullEvent) {
+        self.pull_events.record(event).await;
+    }
+
     /// Get upstream client for a specific registry
     ///
     /// Fallback chain for registry client resolution:
