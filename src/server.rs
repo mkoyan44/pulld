@@ -17,7 +17,23 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::error;
+
+fn image_reference(name: &str, reference: &str) -> String {
+    if reference.starts_with("sha256:") {
+        format!("{}@{}", name, reference)
+    } else {
+        format!("{}:{}", name, reference)
+    }
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("not-set")
+}
 
 // Wrapper functions to parse multi-segment paths for manifests and blobs
 // Axum's :name only matches single segments, so we need to parse manually
@@ -59,12 +75,23 @@ async fn get_v2_wrapper(
     if let Some(manifests_idx) = path.rfind(MANIFESTS_SUFFIX) {
         let name = path[V2_PREFIX.len()..manifests_idx].to_string();
         let reference = path[manifests_idx + MANIFESTS_SUFFIX.len()..].to_string();
+        let image = image_reference(&name, &reference);
+        let started = Instant::now();
 
         tracing::info!(
             original_path = %path,
             parsed_name = %name,
             parsed_reference = %reference,
             "Registry manifest request parsed"
+        );
+        tracing::info!(
+            event = "pulld_image_manifest_start",
+            method = "GET",
+            image = %image,
+            name = %name,
+            reference = %reference,
+            user_agent = %header_str(&headers, "user-agent"),
+            "Pulld image pull manifest request started"
         );
 
         tracing::debug!(
@@ -74,14 +101,27 @@ async fn get_v2_wrapper(
         );
 
         // Handle manifest request - get_manifest can handle both tags and digests
-        get_manifest(State(state), Path((name, reference)), headers)
+        let response = get_manifest(State(state), Path((name, reference)), headers)
             .await
-            .into_response()
+            .into_response();
+        let status = response.status();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            event = "pulld_image_manifest_complete",
+            method = "GET",
+            image = %image,
+            status = %status,
+            elapsed_ms = elapsed_ms,
+            "Pulld image pull manifest request completed"
+        );
+        response
     }
     // Handle blobs: /v2/library/alpine/blobs/sha256:...
     else if let Some(blobs_idx) = path.rfind(BLOBS_SUFFIX) {
         let name = path[V2_PREFIX.len()..blobs_idx].to_string();
         let digest = path[blobs_idx + BLOBS_SUFFIX.len()..].to_string();
+        let image = format!("{}@{}", name, digest);
+        let started = Instant::now();
 
         tracing::info!(
             method = "GET",
@@ -89,15 +129,38 @@ async fn get_v2_wrapper(
             digest = %digest,
             "Registry blob request parsed"
         );
+        tracing::info!(
+            event = "pulld_image_blob_start",
+            method = "GET",
+            image = %image,
+            name = %name,
+            digest = %digest,
+            user_agent = %header_str(&headers, "user-agent"),
+            range = %header_str(&headers, "range"),
+            "Pulld image pull blob request started"
+        );
 
         tracing::debug!(
             name = %name,
             digest = %digest,
             "Parsed blob request from path"
         );
-        get_blob(State(state), Path((name, digest)), headers)
+        let response = get_blob(State(state), Path((name, digest)), headers)
             .await
-            .into_response()
+            .into_response();
+        let status = response.status();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let cache = header_str(response.headers(), "x-cache");
+        tracing::info!(
+            event = "pulld_image_blob_response_opened",
+            method = "GET",
+            image = %image,
+            status = %status,
+            cache = %cache,
+            elapsed_ms = elapsed_ms,
+            "Pulld image pull blob response opened"
+        );
+        response
     } else {
         (StatusCode::BAD_REQUEST, "Invalid v2 path").into_response()
     }
@@ -125,6 +188,8 @@ async fn head_v2_wrapper(
     if let Some(manifests_idx) = path.rfind(MANIFESTS_SUFFIX) {
         let name = path[V2_PREFIX.len()..manifests_idx].to_string();
         let reference = path[manifests_idx + MANIFESTS_SUFFIX.len()..].to_string();
+        let image = image_reference(&name, &reference);
+        let started = Instant::now();
 
         tracing::info!(
             method = "HEAD",
@@ -132,23 +197,65 @@ async fn head_v2_wrapper(
             reference = %reference,
             "Registry manifest request parsed"
         );
+        tracing::info!(
+            event = "pulld_image_manifest_start",
+            method = "HEAD",
+            image = %image,
+            name = %name,
+            reference = %reference,
+            "Pulld image pull manifest request started"
+        );
 
         // Handle HEAD manifest request - head_manifest can handle both tags and digests
-        head_manifest(State(state), Path((name, reference)))
+        let response = head_manifest(State(state), Path((name, reference)))
             .await
-            .into_response()
+            .into_response();
+        let status = response.status();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            event = "pulld_image_manifest_complete",
+            method = "HEAD",
+            image = %image,
+            status = %status,
+            elapsed_ms = elapsed_ms,
+            "Pulld image pull manifest request completed"
+        );
+        response
     } else if let Some(blobs_idx) = path.rfind(BLOBS_SUFFIX) {
         let name = path[V2_PREFIX.len()..blobs_idx].to_string();
         let digest = path[blobs_idx + BLOBS_SUFFIX.len()..].to_string();
+        let image = format!("{}@{}", name, digest);
+        let started = Instant::now();
         tracing::info!(
             method = "HEAD",
             name = %name,
             digest = %digest,
             "Registry blob request parsed"
         );
-        head_blob(State(state), Path((name, digest)))
+        tracing::info!(
+            event = "pulld_image_blob_start",
+            method = "HEAD",
+            image = %image,
+            name = %name,
+            digest = %digest,
+            "Pulld image pull blob request started"
+        );
+        let response = head_blob(State(state), Path((name, digest)))
             .await
-            .into_response()
+            .into_response();
+        let status = response.status();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let cache = header_str(response.headers(), "x-cache");
+        tracing::info!(
+            event = "pulld_image_blob_complete",
+            method = "HEAD",
+            image = %image,
+            status = %status,
+            cache = %cache,
+            elapsed_ms = elapsed_ms,
+            "Pulld image pull blob request completed"
+        );
+        response
     } else {
         (StatusCode::BAD_REQUEST, "Invalid v2 path").into_response()
     }

@@ -237,6 +237,7 @@ pub async fn get_blob(
     let registry_config = state.get_registry_config(&registry);
     let strategy = registry_config.strategy;
     let hedge_delay_ms = registry_config.hedge_delay_ms;
+    let image = format!("{}@{}", _name, digest);
 
     // Check for existing partial file for resume
     let temp_path = blob_path.with_extension("tmp");
@@ -267,6 +268,17 @@ pub async fn get_blob(
     let range_header = resume_position.map(|pos| format!("bytes={}-", pos));
 
     // Fetch from upstream
+    tracing::info!(
+        event = "pulld_upstream_blob_pull_start",
+        image = %image,
+        registry = %registry,
+        repository = %repository,
+        digest = %digest,
+        upstream_path = %upstream_path,
+        mirror_count = mirrors.len(),
+        range = %range_header.as_deref().unwrap_or("not-set"),
+        "Pulld upstream image blob pull started"
+    );
     let mut response = match crate::registry::race_mirrors(
         &upstream_client,
         mirrors,
@@ -280,9 +292,27 @@ pub async fn get_blob(
     )
     .await
     {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            let status = resp.status();
+            tracing::info!(
+                event = "pulld_upstream_blob_pull_response",
+                image = %image,
+                registry = %registry,
+                repository = %repository,
+                digest = %digest,
+                status = %status,
+                "Pulld upstream image blob pull response received"
+            );
+            resp
+        }
         Err(e) => {
-            tracing::error!(digest = %digest, error = %e, "Failed to fetch blob from upstream");
+            tracing::error!(
+                event = "pulld_upstream_blob_pull_error",
+                image = %image,
+                digest = %digest,
+                error = %e,
+                "Failed to fetch blob from upstream"
+            );
             return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
         }
     };
@@ -620,6 +650,7 @@ pub async fn get_blob(
     // Stream from upstream to client, caching in background
     let cache_clone = cache.clone();
     let digest_clone = digest.to_string();
+    let image_clone = image.clone();
     let expected_size = content_length;
 
     // Create a channel to tee the stream
@@ -681,11 +712,20 @@ pub async fn get_blob(
 
                     // Send to client
                     if tx.send(Ok(chunk)).await.is_err() {
+                        tracing::warn!(
+                            event = "pulld_image_blob_client_disconnected",
+                            image = %image_clone,
+                            digest = %digest_clone,
+                            bytes_streamed = total_bytes,
+                            "Client disconnected while Pulld was streaming image blob"
+                        );
                         break; // Client disconnected
                     }
                 }
                 Err(e) => {
                     tracing::error!(
+                        event = "pulld_image_blob_stream_error",
+                        image = %image_clone,
                         digest = %digest_clone,
                         error = %e,
                         total_bytes = total_bytes,
@@ -710,10 +750,18 @@ pub async fn get_blob(
 
                 if size_ok && digest_ok {
                     if tokio::fs::rename(&temp_path, &blob_path).await.is_ok() {
-                        tracing::info!(digest = %digest_clone, size = total_bytes, "Blob cached successfully");
+                        tracing::info!(
+                            event = "pulld_image_blob_cached",
+                            image = %image_clone,
+                            digest = %digest_clone,
+                            size = total_bytes,
+                            "Pulld image blob cached successfully"
+                        );
                     }
                 } else {
                     tracing::warn!(
+                        event = "pulld_image_blob_verification_failed",
+                        image = %image_clone,
                         digest = %digest_clone,
                         expected_digest = %digest_clone,
                         calculated_digest = %calculated_digest,
