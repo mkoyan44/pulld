@@ -31,7 +31,7 @@ cargo run --bin pulld -- ./cache/pulld
 Build the container image:
 
 ```bash
-docker build -t ghcr.io/mkoyan44/pulld:0.1.1 .
+docker build -t ghcr.io/mkoyan44/pulld:0.2.1 .
 ```
 
 Install with Helm:

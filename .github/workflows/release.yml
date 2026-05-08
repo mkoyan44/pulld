@@ -46,27 +46,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Set up Helm
-        uses: azure/setup-helm@v4
-
-      - name: Package chart
-        shell: bash
-        run: |
-          mkdir -p target/charts
-          helm package charts/pulld \
-            --version "${{ steps.version.outputs.version }}" \
-            --app-version "${{ steps.version.outputs.version }}" \
-            --destination target/charts
-
-      - name: Push chart
-        shell: bash
-        run: |
-          helm registry login ghcr.io \
-            --username "${{ github.actor }}" \
-            --password "${{ secrets.GITHUB_TOKEN }}"
-          helm push "target/charts/pulld-${{ steps.version.outputs.version }}.tgz" \
-            "oci://ghcr.io/${{ github.repository_owner }}/charts"
