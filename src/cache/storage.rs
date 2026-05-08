@@ -41,7 +41,15 @@ enum CacheBackend {
 pub struct CachedBlob {
     pub size: u64,
     pub range_start: Option<u64>,
+    pub range_end: Option<u64>,
     pub body: Body,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobByteRange {
+    pub start: u64,
+    /// Inclusive byte offset from the HTTP Range header.
+    pub end: Option<u64>,
 }
 
 const S3_MULTIPART_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -400,7 +408,7 @@ impl CacheStorage {
     pub async fn open_blob(
         &self,
         digest: &str,
-        range_start: Option<u64>,
+        range: Option<BlobByteRange>,
     ) -> Result<Option<CachedBlob>> {
         let Some(size) = self.blob_size(digest).await else {
             return Ok(None);
@@ -409,10 +417,20 @@ impl CacheStorage {
             return Ok(None);
         }
 
-        let start = range_start.unwrap_or(0);
-        if start >= size {
-            return Ok(None);
-        }
+        let requested_range = if let Some(range) = range {
+            if range.start >= size {
+                return Ok(None);
+            }
+            let end = range.end.unwrap_or(size - 1).min(size - 1);
+            if end < range.start {
+                return Ok(None);
+            }
+            Some((range.start, end))
+        } else {
+            None
+        };
+        let start = requested_range.map(|(start, _)| start).unwrap_or(0);
+        let end_exclusive = requested_range.map(|(_, end)| end + 1).unwrap_or(size);
 
         let body = match &self.backend {
             CacheBackend::Filesystem => {
@@ -429,14 +447,14 @@ impl CacheStorage {
                             ))
                         })?;
                 }
-                Body::from_stream(ReaderStream::new(file))
+                Body::from_stream(ReaderStream::new(file.take(end_exclusive - start)))
             }
             CacheBackend::ObjectStore { store, .. } => {
                 let key = self.blob_object_key(digest);
                 let path = ObjectPath::from(key);
-                let options = if start > 0 {
+                let options = if requested_range.is_some() {
                     GetOptions {
-                        range: Some((start..size).into()),
+                        range: Some((start..end_exclusive).into()),
                         ..Default::default()
                     }
                 } else {
@@ -451,7 +469,8 @@ impl CacheStorage {
 
         Ok(Some(CachedBlob {
             size,
-            range_start: range_start.filter(|start| *start > 0),
+            range_start: requested_range.map(|(start, _)| start),
+            range_end: requested_range.map(|(_, end)| end),
             body,
         }))
     }
