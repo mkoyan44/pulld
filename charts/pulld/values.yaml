@@ -34,7 +34,19 @@ securityContext:
   readOnlyRootFilesystem: true
 
 cache:
+  backend: filesystem
   dir: /var/lib/pulld/cache
+
+s3:
+  endpoint: ""
+  bucket: pulld-cache
+  region: us-east-1
+  forcePathStyle: true
+  scratchDir: /tmp/pulld-cache
+  prefix: ""
+  existingSecret: ""
+  accessKeyIdKey: MINIO_ROOT_USER
+  secretAccessKeyKey: MINIO_ROOT_PASSWORD
 
 extraArgs: []
 extraEnv: []

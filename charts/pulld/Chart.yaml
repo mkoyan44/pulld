@@ -2,8 +2,8 @@ apiVersion: v2
 name: pulld
 description: A Rust pull-through proxy for container registries and Helm artifacts.
 type: application
-version: 0.1.1
-appVersion: "0.1.1"
+version: 0.2.0
+appVersion: "0.3.0"
 home: https://github.com/mkoyan44/pulld
 sources:
   - https://github.com/mkoyan44/pulld

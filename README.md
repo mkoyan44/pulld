@@ -1,14 +1,14 @@
 # Pulld
 
 Pulld is a Rust pull-through proxy for container registries. It caches manifests,
-blobs, and Helm artifacts locally, supports multiple upstream registries and
-mirrors, and exposes a Docker Registry HTTP API compatible with containerd and
-other OCI clients.
+blobs, and Helm artifacts on either local disk or S3-compatible object storage,
+supports multiple upstream registries and mirrors, and exposes a Docker Registry
+HTTP API compatible with containerd and other OCI clients.
 
 ## Features
 
 - Multi-registry proxying for Docker Hub, Quay, GHCR, registry.k8s.io, and custom registries
-- Local cache for manifests, blobs, Helm indexes, and Helm chart archives
+- Filesystem or S3-compatible cache for manifests, blobs, tag mappings, and Helm chart archives
 - Mirror strategies: failover, hedged, striped, and adaptive
 - Anonymous and bearer-token registry pulls, including per-mirror token exchange
 - Containerd-friendly tag, digest, GET, and HEAD behavior
@@ -31,7 +31,7 @@ cargo run --bin pulld -- ./cache/pulld
 Build the container image:
 
 ```bash
-docker build -t ghcr.io/mkoyan44/pulld:0.2.1 .
+docker build -t ghcr.io/mkoyan44/pulld:0.3.0 .
 ```
 
 Install with Helm:
@@ -53,6 +53,31 @@ The server listens on `0.0.0.0:5050` by default and exposes:
 - `POST /api/v1/pre-pull`
 - `GET /api/v1/cache/stats`
 - `GET /api/v1/mirror/stats`
+
+## Cache Backends
+
+Filesystem caching is the default and keeps the cache under the directory passed
+as the first CLI argument:
+
+```bash
+PULLD_CACHE_BACKEND=filesystem cargo run --bin pulld -- ./cache/pulld
+```
+
+For MinIO or another S3-compatible backend, Pulld uses local disk only as
+scratch space while verified blobs, manifests, tag mappings, and Helm charts are
+stored in the bucket:
+
+```bash
+PULLD_CACHE_BACKEND=s3 \
+PULLD_S3_ENDPOINT=http://pulld-minio-hl.pulld.svc.cluster.local:9000 \
+PULLD_S3_BUCKET=pulld-cache \
+PULLD_S3_REGION=us-east-1 \
+PULLD_S3_FORCE_PATH_STYLE=true \
+PULLD_S3_ACCESS_KEY_ID=minio \
+PULLD_S3_SECRET_ACCESS_KEY=minio-secret \
+PULLD_S3_SCRATCH_DIR=/tmp/pulld-cache \
+pulld /tmp/pulld-cache
+```
 
 ## Library Usage
 

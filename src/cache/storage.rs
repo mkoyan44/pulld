@@ -1,15 +1,48 @@
 use crate::error::{DockerProxyError, Result};
+use axum::body::Body;
+use bytes::Bytes;
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectPath;
+use object_store::{GetOptions, ObjectStore, PutPayload};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{broadcast, Mutex};
+use tokio_util::io::ReaderStream;
 
 /// Download guard for singleflight deduplication
 /// Maps digest to a broadcast sender that can send the download result to multiple waiters
 /// Using Arc<Result> to make it Clone-able for broadcast channel
 type DownloadGuard = Arc<Mutex<HashMap<String, broadcast::Sender<Arc<Result<Vec<u8>>>>>>>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct S3CacheConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub force_path_style: bool,
+    pub prefix: String,
+}
+
+#[derive(Clone)]
+enum CacheBackend {
+    Filesystem,
+    ObjectStore {
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+    },
+}
+
+pub struct CachedBlob {
+    pub size: u64,
+    pub range_start: Option<u64>,
+    pub body: Body,
+}
 
 /// Content-addressable blob storage
 pub struct CacheStorage {
@@ -18,6 +51,7 @@ pub struct CacheStorage {
     manifests_dir: PathBuf,
     charts_dir: PathBuf,
     max_size_bytes: u64,
+    backend: CacheBackend,
     /// Tracks in-flight downloads to prevent duplicate concurrent downloads
     in_flight: DownloadGuard,
 }
@@ -51,8 +85,69 @@ impl CacheStorage {
             manifests_dir,
             charts_dir,
             max_size_bytes,
+            backend: CacheBackend::Filesystem,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub fn with_s3_config(
+        base_dir: PathBuf,
+        max_size_gb: Option<u64>,
+        config: S3CacheConfig,
+    ) -> Result<Self> {
+        let allow_http = config.endpoint.starts_with("http://");
+        let store = AmazonS3Builder::new()
+            .with_endpoint(config.endpoint)
+            .with_bucket_name(config.bucket)
+            .with_region(config.region)
+            .with_access_key_id(config.access_key_id)
+            .with_secret_access_key(config.secret_access_key)
+            .with_allow_http(allow_http)
+            .with_virtual_hosted_style_request(!config.force_path_style)
+            .build()
+            .map_err(|e| DockerProxyError::Cache(format!("Failed to build S3 cache: {}", e)))?;
+
+        Self::with_object_store(base_dir, Arc::new(store), config.prefix, max_size_gb)
+    }
+
+    pub fn with_object_store(
+        base_dir: PathBuf,
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+        max_size_gb: Option<u64>,
+    ) -> Result<Self> {
+        let blobs_dir = base_dir.join("blobs").join("sha256");
+        let manifests_dir = base_dir.join("manifests");
+        let charts_dir = base_dir.join("charts");
+
+        std::fs::create_dir_all(&blobs_dir)
+            .map_err(|e| DockerProxyError::Cache(format!("Failed to create blobs dir: {}", e)))?;
+        std::fs::create_dir_all(&manifests_dir).map_err(|e| {
+            DockerProxyError::Cache(format!("Failed to create manifests dir: {}", e))
+        })?;
+        std::fs::create_dir_all(&charts_dir)
+            .map_err(|e| DockerProxyError::Cache(format!("Failed to create charts dir: {}", e)))?;
+
+        let max_size_bytes = max_size_gb
+            .map(|gb| gb * 1024 * 1024 * 1024)
+            .unwrap_or(u64::MAX);
+
+        Ok(Self {
+            base_dir,
+            blobs_dir,
+            manifests_dir,
+            charts_dir,
+            max_size_bytes,
+            backend: CacheBackend::ObjectStore {
+                store,
+                prefix: normalize_prefix(&prefix),
+            },
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub fn is_object_store_backed(&self) -> bool {
+        matches!(self.backend, CacheBackend::ObjectStore { .. })
     }
 
     /// Get blob path for a digest
@@ -62,18 +157,88 @@ impl CacheStorage {
         self.blobs_dir.join(digest)
     }
 
+    pub fn blob_object_key(&self, digest: &str) -> String {
+        let digest = digest.strip_prefix("sha256:").unwrap_or(digest);
+        self.object_key(["blobs", "sha256", digest])
+    }
+
+    pub fn manifest_object_key(&self, registry: &str, repository: &str, reference: &str) -> String {
+        let ref_clean = reference.strip_prefix("sha256:").unwrap_or(reference);
+        let ref_safe = ref_clean.replace(':', "_");
+        self.object_key([
+            "manifests",
+            registry,
+            repository,
+            "refs",
+            &format!("{}.json", ref_safe),
+        ])
+    }
+
+    pub fn manifest_object_key_by_digest(
+        &self,
+        registry: &str,
+        repository: &str,
+        digest: &str,
+    ) -> String {
+        let digest = digest.strip_prefix("sha256:").unwrap_or(digest);
+        self.object_key([
+            "manifests",
+            registry,
+            repository,
+            "sha256",
+            &format!("{}.json", digest),
+        ])
+    }
+
+    pub fn tag_digest_mapping_object_key(
+        &self,
+        registry: &str,
+        repository: &str,
+        tag: &str,
+    ) -> String {
+        let tag_safe = tag.replace(':', "_");
+        self.object_key([
+            "manifests",
+            registry,
+            repository,
+            "tags",
+            &format!("{}.digest", tag_safe),
+        ])
+    }
+
+    pub fn chart_object_key(&self, repo: &str, chart: &str) -> String {
+        self.object_key(["charts", repo, chart])
+    }
+
     /// Check if blob exists
     pub async fn blob_exists(&self, digest: &str) -> bool {
-        self.blob_path(digest).exists()
+        match &self.backend {
+            CacheBackend::Filesystem => self.blob_path(digest).exists(),
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.blob_object_key(digest);
+                object_head(store.as_ref(), &key).await.is_ok()
+            }
+        }
     }
 
     /// Get blob size in bytes
     pub async fn blob_size(&self, digest: &str) -> Option<u64> {
-        let path = self.blob_path(digest);
-        if let Ok(metadata) = tokio::fs::metadata(&path).await {
-            Some(metadata.len())
-        } else {
-            None
+        match &self.backend {
+            CacheBackend::Filesystem => {
+                let path = self.blob_path(digest);
+                if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                    Some(metadata.len())
+                } else {
+                    None
+                }
+            }
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.blob_object_key(digest);
+                object_head(store.as_ref(), &key)
+                    .await
+                    .ok()
+                    .map(|meta| meta.size)
+            }
         }
     }
 
@@ -169,27 +334,133 @@ impl CacheStorage {
 
     /// Read blob content
     pub async fn read_blob(&self, digest: &str) -> Result<Vec<u8>> {
-        let path = self.blob_path(digest);
+        match &self.backend {
+            CacheBackend::Filesystem => {
+                let path = self.blob_path(digest);
 
-        // Touch the file to update access time for LRU eviction
-        // This ensures recently accessed blobs are less likely to be evicted
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(&path)
-        {
-            // Just opening the file with write=false won't update mtime on some systems
-            // But the read operation itself signals recent access
-            drop(file);
+                // Touch the file to update access time for LRU eviction
+                // This ensures recently accessed blobs are less likely to be evicted
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(false)
+                    .open(&path)
+                {
+                    // Just opening the file with write=false won't update mtime on some systems
+                    // But the read operation itself signals recent access
+                    drop(file);
+                }
+
+                fs::read(&path).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to read blob {}: {}", digest, e))
+                })
+            }
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.blob_object_key(digest);
+                object_get(store.as_ref(), &key).await
+            }
+        }
+    }
+
+    /// Read blob content from byte offset to EOF.
+    pub async fn read_blob_range(&self, digest: &str, start: u64) -> Result<Vec<u8>> {
+        let size = self
+            .blob_size(digest)
+            .await
+            .ok_or_else(|| DockerProxyError::Cache(format!("Blob not found: {}", digest)))?;
+        if start >= size {
+            return Ok(Vec::new());
         }
 
-        fs::read(&path)
-            .await
-            .map_err(|e| DockerProxyError::Cache(format!("Failed to read blob {}: {}", digest, e)))
+        match &self.backend {
+            CacheBackend::Filesystem => {
+                let mut file = fs::File::open(self.blob_path(digest)).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to open blob {}: {}", digest, e))
+                })?;
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|e| {
+                        DockerProxyError::Cache(format!("Failed to seek blob {}: {}", digest, e))
+                    })?;
+                let mut data = Vec::new();
+                file.read_to_end(&mut data).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to read blob {}: {}", digest, e))
+                })?;
+                Ok(data)
+            }
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.blob_object_key(digest);
+                object_get_range(store.as_ref(), &key, start, size).await
+            }
+        }
+    }
+
+    pub async fn open_blob(
+        &self,
+        digest: &str,
+        range_start: Option<u64>,
+    ) -> Result<Option<CachedBlob>> {
+        let Some(size) = self.blob_size(digest).await else {
+            return Ok(None);
+        };
+        if size == 0 {
+            return Ok(None);
+        }
+
+        let start = range_start.unwrap_or(0);
+        if start >= size {
+            return Ok(None);
+        }
+
+        let body = match &self.backend {
+            CacheBackend::Filesystem => {
+                let mut file = fs::File::open(self.blob_path(digest)).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to open blob {}: {}", digest, e))
+                })?;
+                if start > 0 {
+                    file.seek(std::io::SeekFrom::Start(start))
+                        .await
+                        .map_err(|e| {
+                            DockerProxyError::Cache(format!(
+                                "Failed to seek blob {}: {}",
+                                digest, e
+                            ))
+                        })?;
+                }
+                Body::from_stream(ReaderStream::new(file))
+            }
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.blob_object_key(digest);
+                let path = ObjectPath::from(key);
+                let options = if start > 0 {
+                    GetOptions {
+                        range: Some((start..size).into()),
+                        ..Default::default()
+                    }
+                } else {
+                    GetOptions::default()
+                };
+                let result = store.get_opts(&path, options).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to open S3 blob {}: {}", digest, e))
+                })?;
+                Body::from_stream(result.into_stream())
+            }
+        };
+
+        Ok(Some(CachedBlob {
+            size,
+            range_start: range_start.filter(|start| *start > 0),
+            body,
+        }))
     }
 
     /// Write blob content (atomic write)
     pub async fn write_blob(&self, digest: &str, data: &[u8]) -> Result<()> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.blob_object_key(digest);
+            object_put(store.as_ref(), &key, Bytes::copy_from_slice(data)).await?;
+            return Ok(());
+        }
+
         let path = self.blob_path(digest);
 
         // Create parent directory if needed
@@ -244,6 +515,44 @@ impl CacheStorage {
         digest: &str,
         mut reader: R,
     ) -> Result<u64> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.blob_object_key(digest);
+            let path = ObjectPath::from(key);
+            let mut upload = store.put_multipart(&path).await.map_err(|e| {
+                DockerProxyError::Cache(format!("Failed to start S3 blob upload {}: {}", digest, e))
+            })?;
+            let mut written = 0u64;
+            let mut buffer = vec![0u8; 8 * 1024 * 1024];
+
+            loop {
+                let n = reader.read(&mut buffer).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to read blob stream: {}", e))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                written += n as u64;
+                upload
+                    .put_part(Bytes::copy_from_slice(&buffer[..n]).into())
+                    .await
+                    .map_err(|e| {
+                        DockerProxyError::Cache(format!(
+                            "Failed to upload S3 blob part {}: {}",
+                            digest, e
+                        ))
+                    })?;
+            }
+
+            if written == 0 {
+                object_put(store.as_ref(), &self.blob_object_key(digest), Bytes::new()).await?;
+            } else {
+                upload.complete().await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to complete S3 blob {}: {}", digest, e))
+                })?;
+            }
+            return Ok(written);
+        }
+
         let path = self.blob_path(digest);
 
         if let Some(parent) = path.parent() {
@@ -289,6 +598,34 @@ impl CacheStorage {
             .map_err(|e| DockerProxyError::Cache(format!("Failed to rename blob: {}", e)))?;
 
         Ok(written)
+    }
+
+    pub async fn commit_blob_from_temp(&self, digest: &str, temp_path: &Path) -> Result<()> {
+        match &self.backend {
+            CacheBackend::Filesystem => {
+                let path = self.blob_path(digest);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).await.map_err(|e| {
+                        DockerProxyError::Cache(format!("Failed to create blob dir: {}", e))
+                    })?;
+                }
+                fs::rename(temp_path, &path).await.map_err(|e| {
+                    DockerProxyError::Cache(format!("Failed to commit blob {}: {}", digest, e))
+                })?;
+            }
+            CacheBackend::ObjectStore { .. } => {
+                let file = fs::File::open(temp_path).await.map_err(|e| {
+                    DockerProxyError::Cache(format!(
+                        "Failed to open verified blob temp file {}: {}",
+                        temp_path.display(),
+                        e
+                    ))
+                })?;
+                self.write_blob_stream(digest, file).await?;
+                let _ = fs::remove_file(temp_path).await;
+            }
+        }
+        Ok(())
     }
 
     /// Get manifest path for a repository and reference (legacy tag-based)
@@ -341,6 +678,24 @@ impl CacheStorage {
         repository: &str,
         tag: &str,
     ) -> Result<Option<String>> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.tag_digest_mapping_object_key(registry, repository, tag);
+            return match object_get(store.as_ref(), &key).await {
+                Ok(digest) => Ok(Some(String::from_utf8_lossy(&digest).trim().to_string())),
+                Err(DockerProxyError::Cache(message)) if message.contains("not found") => Ok(None),
+                Err(e) => {
+                    tracing::warn!(
+                        registry = %registry,
+                        repository = %repository,
+                        tag = %tag,
+                        error = %e,
+                        "Failed to read S3 tag-to-digest mapping"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+
         let path = self.tag_digest_mapping_path(registry, repository, tag);
 
         if !path.exists() {
@@ -370,6 +725,24 @@ impl CacheStorage {
         tag: &str,
         digest: &str,
     ) -> Result<()> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.tag_digest_mapping_object_key(registry, repository, tag);
+            object_put(
+                store.as_ref(),
+                &key,
+                Bytes::copy_from_slice(digest.as_bytes()),
+            )
+            .await?;
+            tracing::debug!(
+                registry = %registry,
+                repository = %repository,
+                tag = %tag,
+                digest = %digest,
+                "S3 tag-to-digest mapping written"
+            );
+            return Ok(());
+        }
+
         let path = self.tag_digest_mapping_path(registry, repository, tag);
 
         if let Some(parent) = path.parent() {
@@ -403,8 +776,15 @@ impl CacheStorage {
         repository: &str,
         digest: &str,
     ) -> bool {
-        self.manifest_path_by_digest(registry, repository, digest)
-            .exists()
+        match &self.backend {
+            CacheBackend::Filesystem => self
+                .manifest_path_by_digest(registry, repository, digest)
+                .exists(),
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.manifest_object_key_by_digest(registry, repository, digest);
+                object_head(store.as_ref(), &key).await.is_ok()
+            }
+        }
     }
 
     /// Read manifest content by digest
@@ -414,6 +794,11 @@ impl CacheStorage {
         repository: &str,
         digest: &str,
     ) -> Result<Vec<u8>> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.manifest_object_key_by_digest(registry, repository, digest);
+            return object_get(store.as_ref(), &key).await;
+        }
+
         let path = self.manifest_path_by_digest(registry, repository, digest);
         fs::read(&path).await.map_err(|e| {
             DockerProxyError::Cache(format!(
@@ -431,6 +816,16 @@ impl CacheStorage {
         digest: &str,
         data: &[u8],
     ) -> Result<()> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.manifest_object_key_by_digest(registry, repository, digest);
+            object_put(store.as_ref(), &key, Bytes::copy_from_slice(data)).await?;
+            tracing::debug!(
+                key = %key,
+                "Manifest written to S3 cache successfully by digest"
+            );
+            return Ok(());
+        }
+
         let path = self.manifest_path_by_digest(registry, repository, digest);
 
         tracing::debug!(
@@ -494,7 +889,15 @@ impl CacheStorage {
 
     /// Check if manifest exists
     pub async fn manifest_exists(&self, registry: &str, repository: &str, reference: &str) -> bool {
-        self.manifest_path(registry, repository, reference).exists()
+        match &self.backend {
+            CacheBackend::Filesystem => {
+                self.manifest_path(registry, repository, reference).exists()
+            }
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.manifest_object_key(registry, repository, reference);
+                object_head(store.as_ref(), &key).await.is_ok()
+            }
+        }
     }
 
     /// Read manifest content
@@ -504,6 +907,11 @@ impl CacheStorage {
         repository: &str,
         reference: &str,
     ) -> Result<Vec<u8>> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.manifest_object_key(registry, repository, reference);
+            return object_get(store.as_ref(), &key).await;
+        }
+
         let path = self.manifest_path(registry, repository, reference);
         fs::read(&path).await.map_err(|e| {
             DockerProxyError::Cache(format!(
@@ -520,6 +928,11 @@ impl CacheStorage {
         repository: &str,
         reference: &str,
     ) -> Result<()> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.manifest_object_key(registry, repository, reference);
+            return object_delete(store.as_ref(), &key).await;
+        }
+
         let path = self.manifest_path(registry, repository, reference);
         fs::remove_file(&path).await.map_err(|e| {
             DockerProxyError::Cache(format!(
@@ -537,6 +950,16 @@ impl CacheStorage {
         reference: &str,
         data: &[u8],
     ) -> Result<()> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.manifest_object_key(registry, repository, reference);
+            object_put(store.as_ref(), &key, Bytes::copy_from_slice(data)).await?;
+            tracing::debug!(
+                key = %key,
+                "Manifest written to S3 cache successfully"
+            );
+            return Ok(());
+        }
+
         let path = self.manifest_path(registry, repository, reference);
 
         tracing::debug!(
@@ -597,11 +1020,22 @@ impl CacheStorage {
 
     /// Check if chart exists in cache
     pub async fn chart_exists(&self, repo: &str, chart: &str) -> bool {
-        self.chart_path(repo, chart).exists()
+        match &self.backend {
+            CacheBackend::Filesystem => self.chart_path(repo, chart).exists(),
+            CacheBackend::ObjectStore { store, .. } => {
+                let key = self.chart_object_key(repo, chart);
+                object_head(store.as_ref(), &key).await.is_ok()
+            }
+        }
     }
 
     /// Read chart from cache
     pub async fn read_chart(&self, repo: &str, chart: &str) -> Result<Vec<u8>> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.chart_object_key(repo, chart);
+            return object_get(store.as_ref(), &key).await;
+        }
+
         let path = self.chart_path(repo, chart);
         fs::read(&path).await.map_err(|e| {
             DockerProxyError::Cache(format!("Failed to read chart {}/{}: {}", repo, chart, e))
@@ -610,6 +1044,16 @@ impl CacheStorage {
 
     /// Write chart to cache (atomic write)
     pub async fn write_chart(&self, repo: &str, chart: &str, data: &[u8]) -> Result<()> {
+        if let CacheBackend::ObjectStore { store, .. } = &self.backend {
+            let key = self.chart_object_key(repo, chart);
+            object_put(store.as_ref(), &key, Bytes::copy_from_slice(data)).await?;
+            tracing::debug!(
+                key = %key,
+                "Helm chart written to S3 cache successfully"
+            );
+            return Ok(());
+        }
+
         let path = self.chart_path(repo, chart);
 
         tracing::debug!(
@@ -746,5 +1190,82 @@ impl CacheStorage {
         }
 
         Ok(())
+    }
+
+    fn object_key<'a>(&self, parts: impl IntoIterator<Item = &'a str>) -> String {
+        let mut segments: Vec<String> = Vec::new();
+        if let CacheBackend::ObjectStore { prefix, .. } = &self.backend {
+            if !prefix.is_empty() {
+                segments.push(prefix.clone());
+            }
+        }
+        segments.extend(
+            parts
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .map(str::to_string),
+        );
+        segments.join("/")
+    }
+}
+
+fn normalize_prefix(prefix: &str) -> String {
+    prefix.trim_matches('/').to_string()
+}
+
+async fn object_head(
+    store: &dyn ObjectStore,
+    key: &str,
+) -> std::result::Result<object_store::ObjectMeta, object_store::Error> {
+    store.head(&ObjectPath::from(key.to_string())).await
+}
+
+async fn object_get(store: &dyn ObjectStore, key: &str) -> Result<Vec<u8>> {
+    store
+        .get(&ObjectPath::from(key.to_string()))
+        .await
+        .map_err(|e| object_error("read", key, e))?
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| object_error("read", key, e))
+}
+
+async fn object_get_range(
+    store: &dyn ObjectStore,
+    key: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>> {
+    store
+        .get_range(&ObjectPath::from(key.to_string()), start..end)
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| object_error("read range", key, e))
+}
+
+async fn object_put(store: &dyn ObjectStore, key: &str, data: Bytes) -> Result<()> {
+    store
+        .put(&ObjectPath::from(key.to_string()), PutPayload::from(data))
+        .await
+        .map(|_| ())
+        .map_err(|e| object_error("write", key, e))
+}
+
+async fn object_delete(store: &dyn ObjectStore, key: &str) -> Result<()> {
+    store
+        .delete(&ObjectPath::from(key.to_string()))
+        .await
+        .map_err(|e| object_error("delete", key, e))
+}
+
+fn object_error(action: &str, key: &str, error: object_store::Error) -> DockerProxyError {
+    match error {
+        object_store::Error::NotFound { .. } => {
+            DockerProxyError::Cache(format!("S3 object not found during {}: {}", action, key))
+        }
+        other => {
+            DockerProxyError::Cache(format!("Failed to {} S3 object {}: {}", action, key, other))
+        }
     }
 }

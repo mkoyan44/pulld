@@ -1,6 +1,6 @@
 use crate::cache::CacheStorage;
 use crate::config::{
-    Config, DEFAULT_INITIAL_RTT_MS, DEFAULT_MIRROR_SCORE, DEFAULT_REGISTRY_NAME,
+    CacheBackendKind, Config, DEFAULT_INITIAL_RTT_MS, DEFAULT_MIRROR_SCORE, DEFAULT_REGISTRY_NAME,
     DEFAULT_REGISTRY_URL,
 };
 use crate::error::{DockerProxyError, Result};
@@ -386,12 +386,24 @@ pub async fn start_server(
         "[pulld] Initializing cache storage at: {}",
         cache_dir.display()
     );
-    let cache_storage = Arc::new(CacheStorage::with_max_size(
-        cache_dir.clone(),
-        Some(config.cache.max_size_gb),
-    )?);
+    let cache_storage = Arc::new(match config.cache.backend {
+        CacheBackendKind::Filesystem => {
+            CacheStorage::with_max_size(cache_dir.clone(), Some(config.cache.max_size_gb))?
+        }
+        CacheBackendKind::S3 => {
+            let s3_config = config.cache.s3.clone().ok_or_else(|| {
+                DockerProxyError::Config("S3 cache backend selected without S3 config".to_string())
+            })?;
+            CacheStorage::with_s3_config(
+                cache_dir.clone(),
+                Some(config.cache.max_size_gb),
+                s3_config,
+            )?
+        }
+    });
     tracing::debug!(
-        "[pulld] Cache storage initialized: max_size={}GB, directory={}",
+        "[pulld] Cache storage initialized: backend={:?}, max_size={}GB, directory={}",
+        config.cache.backend,
         config.cache.max_size_gb,
         cache_dir.display()
     );

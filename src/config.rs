@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+pub use crate::cache::storage::S3CacheConfig;
+
 // Constants for hardcoded values
 /// Default Docker registry name
 pub const DEFAULT_REGISTRY_NAME: &str = "docker.io";
@@ -124,6 +126,35 @@ pub struct TlsConfig {
 pub struct CacheConfig {
     pub directory: String,
     pub max_size_gb: u64,
+    #[serde(default)]
+    pub backend: CacheBackendKind,
+    #[serde(default)]
+    pub s3: Option<S3CacheConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheBackendKind {
+    #[default]
+    Filesystem,
+    S3,
+}
+
+impl<'de> serde::Deserialize<'de> for CacheBackendKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "filesystem" | "fs" => Ok(CacheBackendKind::Filesystem),
+            "s3" | "minio" => Ok(CacheBackendKind::S3),
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown cache backend `{}`, expected `filesystem` or `s3`",
+                s
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +346,8 @@ impl Config {
             cache: CacheConfig {
                 directory: "cache/pulld".to_string(),
                 max_size_gb: 20,
+                backend: CacheBackendKind::Filesystem,
+                s3: None,
             },
             upstream: UpstreamConfig {
                 tls: Some(UpstreamTlsConfig {
@@ -350,6 +383,85 @@ impl Config {
     /// Get the default configuration (built in Rust code, cached in OnceLock)
     pub(crate) fn default_parsed() -> &'static Config {
         DEFAULT_CONFIG.get_or_init(Self::build_default)
+    }
+
+    pub fn apply_env_overrides<I, K, V>(&mut self, vars: I) -> std::result::Result<(), String>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let env: HashMap<String, String> = vars
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_string(), value.as_ref().to_string()))
+            .collect();
+
+        if let Some(port) = env.get("PULLD_HTTPS_PORT") {
+            self.server.port = port
+                .parse()
+                .map_err(|e| format!("invalid PULLD_HTTPS_PORT: {}", e))?;
+        }
+        if let Some(http_port) = env.get("PULLD_HTTP_PORT") {
+            self.server.http_port = Some(
+                http_port
+                    .parse()
+                    .map_err(|e| format!("invalid PULLD_HTTP_PORT: {}", e))?,
+            );
+        }
+        if let (Some(cert_path), Some(key_path)) = (
+            env.get("PULLD_TLS_CERT_PATH"),
+            env.get("PULLD_TLS_KEY_PATH"),
+        ) {
+            self.server.tls = Some(TlsConfig {
+                enabled: true,
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+                client_auth: false,
+                client_ca_path: None,
+            });
+        }
+
+        if let Some(backend) = env.get("PULLD_CACHE_BACKEND") {
+            self.cache.backend = match backend.to_lowercase().as_str() {
+                "filesystem" | "fs" => CacheBackendKind::Filesystem,
+                "s3" | "minio" => CacheBackendKind::S3,
+                _ => {
+                    return Err(format!(
+                        "invalid PULLD_CACHE_BACKEND `{}`, expected filesystem or s3",
+                        backend
+                    ))
+                }
+            };
+        }
+
+        if let Some(scratch_dir) = env.get("PULLD_S3_SCRATCH_DIR") {
+            self.cache.directory = scratch_dir.clone();
+        }
+
+        if self.cache.backend == CacheBackendKind::S3 {
+            let required = |name: &str| {
+                env.get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("{} is required when PULLD_CACHE_BACKEND=s3", name))
+            };
+            self.cache.s3 = Some(S3CacheConfig {
+                endpoint: required("PULLD_S3_ENDPOINT")?,
+                bucket: required("PULLD_S3_BUCKET")?,
+                region: env
+                    .get("PULLD_S3_REGION")
+                    .cloned()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+                access_key_id: required("PULLD_S3_ACCESS_KEY_ID")?,
+                secret_access_key: required("PULLD_S3_SECRET_ACCESS_KEY")?,
+                force_path_style: env
+                    .get("PULLD_S3_FORCE_PATH_STYLE")
+                    .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                    .unwrap_or(true),
+                prefix: env.get("PULLD_S3_PREFIX").cloned().unwrap_or_default(),
+            });
+        }
+
+        Ok(())
     }
 }
 
